@@ -718,8 +718,19 @@ async function loadBuildingTriangles(t) {
     if ('maxBytesSize' in tiles.lruCache) tiles.lruCache.maxBytesSize = Math.max(tiles.lruCache.maxBytesSize || 0, 700e6);
   }
   let loadedEvents=0, lastEvents=-1, stable=0;
-  const onLoad=()=>{ loadedEvents++; stable=0; };
+  // Keep references to every model that was successfully loaded. A 3D-Tiles
+  // renderer can mark parent / refined tiles invisible even though their
+  // geometry is valid and already in memory. Visibility is a rendering state,
+  // not a criterion for whether we may use the mesh for STL extraction.
+  const loadedRoots = new Set();
+  const onLoad=(ev)=>{
+    loadedEvents++; stable=0;
+    if (ev?.scene) loadedRoots.add(ev.scene);
+  };
   tiles.addEventListener?.('load-model', onLoad);
+  tiles.addEventListener?.('load-error', (ev) => {
+    debug(`Gebäude-Tile Fehler: ${ev?.url || ''} ${ev?.error?.message || ev?.error || ''}`);
+  });
   const tmpScene = new THREE.Scene();
   tmpScene.add(tiles.group);
   for (let i=0; i<180; i++) {
@@ -733,18 +744,25 @@ async function loadBuildingTriangles(t) {
   }
   tiles.group.updateMatrixWorld(true);
 
+  // Add models still managed by the renderer as well. Do NOT filter by
+  // root.visible / mesh.visible: refinement and frustum selection routinely
+  // make loaded tiles invisible, which caused v0.6.3 to report zero meshes.
+  tiles.forEachLoadedModel?.((root) => { if (root) loadedRoots.add(root); });
   const meshes=[];
-  tiles.forEachLoadedModel?.((root) => {
-    if (root.visible === false) return;
+  const seenMeshes = new Set();
+  for (const root of loadedRoots) {
     root.updateMatrixWorld(true);
     root.traverse(o => {
-      if (o.isMesh && o.visible !== false && o.geometry?.attributes?.position) meshes.push(o);
+      if (o.isMesh && o.geometry?.attributes?.position && !seenMeshes.has(o)) {
+        seenMeshes.add(o);
+        meshes.push(o);
+      }
     });
-  });
-  debug(`swissBUILDINGS³D: ${meshes.length} geladene Meshes (${loadedEvents} Tile-Ladevorgänge).`);
+  }
+  debug(`swissBUILDINGS³D: ${meshes.length} auswertbare Meshes aus ${loadedRoots.size} geladenen Tile-Szenen (${loadedEvents} Tile-Ladevorgänge).`);
   if (!meshes.length) {
     tiles.dispose?.();
-    throw new Error('Gebäude waren aktiviert, aber swissBUILDINGS³D lieferte für den Ausschnitt keine auswertbaren 3D-Meshes.');
+    throw new Error(`Gebäude waren aktiviert, aber swissBUILDINGS³D lieferte keine auswertbaren Meshes (Tile-Ladevorgänge: ${loadedEvents}).`);
   }
 
   // Estimate the local ellipsoid→terrain vertical offset from low building vertices.
