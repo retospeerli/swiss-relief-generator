@@ -1,6 +1,5 @@
 import * as THREE from 'three';
 import { OrbitControls } from 'https://cdn.jsdelivr.net/npm/three@0.180.0/examples/jsm/controls/OrbitControls.js';
-import { TilesRenderer } from '3d-tiles-renderer';
 
 const STAC_COLLECTION = 'ch.swisstopo.swissalti3d';
 const STAC_ITEMS = `https://data.geo.admin.ch/api/stac/v1/collections/${STAC_COLLECTION}/items`;
@@ -36,6 +35,22 @@ let lastStlBlob = null;
 let renderer, scene, camera, controls, terrainGroup;
 let lastBuildingTriangles = null;
 let lastBuildingMeta = null;
+let TilesRendererClass = null;
+
+async function getTilesRendererClass() {
+  if (TilesRendererClass) return TilesRendererClass;
+  try {
+    // Gebäudecode darf die Grund-App niemals blockieren. Dieses Modul wird erst
+    // geladen, wenn Gebäude ausdrücklich aktiviert wurden. esm.sh löst die
+    // Paketabhängigkeiten browsergerecht auf; THREE bleibt über die Importmap extern.
+    const mod = await import('https://esm.sh/3d-tiles-renderer@0.5.3?external=three');
+    TilesRendererClass = mod.TilesRenderer;
+    if (!TilesRendererClass) throw new Error('TilesRenderer-Export fehlt');
+    return TilesRendererClass;
+  } catch (err) {
+    throw new Error(`Gebäudemodul konnte nicht geladen werden: ${err?.message || err}`);
+  }
+}
 
 // CH1903+ / LV95 (EPSG:2056). proj4 contains the transformation logic; definition is explicit for portability.
 proj4.defs('EPSG:2056', '+proj=somerc +lat_0=46.95240555555556 +lon_0=7.439583333333333 +k_0=1 +x_0=2600000 +y_0=1200000 +ellps=bessel +towgs84=674.374,15.056,405.346,0,0,0,0 +units=m +no_defs');
@@ -693,6 +708,7 @@ async function loadBuildingTriangles(t) {
   tileCam.updateProjectionMatrix();
   tileCam.updateMatrixWorld(true);
 
+  const TilesRenderer = await getTilesRendererClass();
   const tiles = new TilesRenderer(BUILDINGS_TILESET);
   tiles.setCamera(tileCam);
   tiles.setResolution(tileCam, 1600, 1600);
