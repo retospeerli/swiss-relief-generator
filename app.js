@@ -608,30 +608,186 @@ function findAnyGeoTiffAsset(item) {
   return tiffs.find(a => /2056_5728/i.test(String(a.href || ''))) || tiffs[0] || null;
 }
 
+function findRegioXyzAssets(item) {
+  const out = [];
+  for (const [key, a] of Object.entries(item.assets || {})) {
+    const href = String(a?.href || '');
+    const type = String(a?.type || '').toLowerCase();
+    const title = String(a?.title || '');
+    const hay = `${key} ${href} ${type} ${title}`.toLowerCase();
+    // swissALTIRegio is distributed both as one huge COG and as 10×10-km
+    // ASCII XYZ tiles. Prefer the spatial XYZ tiles in a browser: they are
+    // finite downloads (~23 MB each) and avoid fragile cross-origin byte-range
+    // access to the ~12-GB national COG.
+    if (/\.xyz(?:\.zip)?(?:$|\?)/i.test(href) || (hay.includes('xyz') && (hay.includes('zip') || type.includes('text/plain')))) {
+      out.push(a);
+    }
+  }
+  return out;
+}
+
+function decodeRegioTextFromBytes(bytes, url) {
+  const isZip = bytes.length >= 4 && bytes[0] === 0x50 && bytes[1] === 0x4b;
+  if (!isZip) return new TextDecoder('utf-8').decode(bytes);
+  if (!globalThis.fflate?.unzipSync) throw new Error('ZIP-Dekompressor (fflate) nicht geladen');
+  const files = globalThis.fflate.unzipSync(bytes);
+  const entries = Object.entries(files)
+    .filter(([name, data]) => data?.length && !name.endsWith('/'))
+    .sort((a, b) => {
+      const ax = /\.(xyz|txt|asc)$/i.test(a[0]) ? 1 : 0;
+      const bx = /\.(xyz|txt|asc)$/i.test(b[0]) ? 1 : 0;
+      return (bx - ax) || (b[1].length - a[1].length);
+    });
+  if (!entries.length) throw new Error(`ZIP enthält keine XYZ-Datei: ${url}`);
+  return new TextDecoder('utf-8').decode(entries[0][1]);
+}
+
+function eachXyzLine(text, cb) {
+  let start = 0;
+  for (let i = 0; i <= text.length; i++) {
+    if (i !== text.length && text.charCodeAt(i) !== 10) continue;
+    let line = text.slice(start, i).trim();
+    start = i + 1;
+    if (!line || line[0] === '#') continue;
+    // Official files are whitespace separated; accepting commas/semicolons
+    // makes the fallback tolerant of future export variants.
+    const parts = line.split(/[\s,;]+/);
+    if (parts.length < 3) continue;
+    const x = Number(parts[0]), y = Number(parts[1]), z = Number(parts[2]);
+    if (Number.isFinite(x) && Number.isFinite(y) && Number.isFinite(z)) cb(x, y, z);
+  }
+}
+
+async function sampleRegioXyzAsset(url, d, grid) {
+  const response = await fetchWithRetry(url, { cache: 'force-cache' });
+  const bytes = new Uint8Array(await response.arrayBuffer());
+  const text = decodeRegioTextFromBytes(bytes, url);
+
+  // Determine the actual regular 10-m tile bounds first. This avoids making
+  // assumptions from filenames and keeps the parser compatible with any
+  // official XYZ tile naming convention.
+  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity, n = 0;
+  eachXyzLine(text, (x, y) => {
+    if (x < minX) minX = x; if (x > maxX) maxX = x;
+    if (y < minY) minY = y; if (y > maxY) maxY = y; n++;
+  });
+  if (!n || !Number.isFinite(minX)) throw new Error('XYZ-Datei enthält keine gültigen Höhenpunkte');
+  if (maxX < d.minX - 20 || minX > d.maxX + 20 || maxY < d.minY - 20 || minY > d.maxY + 20) return 0;
+
+  const step = 10;
+  const cols = Math.round((maxX - minX) / step) + 1;
+  const rows = Math.round((maxY - minY) / step) + 1;
+  if (cols < 2 || rows < 2 || cols * rows > 2_000_000) throw new Error(`Unerwartetes swissALTIRegio-XYZ-Raster ${cols}×${rows}`);
+  const src = new Float32Array(cols * rows);
+  src.fill(NaN);
+  eachXyzLine(text, (x, y, z) => {
+    const c = Math.round((x - minX) / step);
+    const r = Math.round((maxY - y) / step); // north to south
+    if (c >= 0 && c < cols && r >= 0 && r < rows) src[r * cols + c] = z;
+  });
+
+  const valid = v => Number.isFinite(v) && v >= -1000;
+  const at = (c, r) => {
+    c = Math.max(0, Math.min(cols - 1, c));
+    r = Math.max(0, Math.min(rows - 1, r));
+    return src[r * cols + c];
+  };
+  let written = 0;
+  for (let r = 0; r < grid.rows; r++) {
+    const y = d.maxY - r / (grid.rows - 1) * d.groundH;
+    if (y < minY - 1e-6 || y > maxY + 1e-6) continue;
+    const rf = (maxY - y) / step;
+    const r0 = Math.floor(rf), ty = rf - r0;
+    for (let c = 0; c < grid.cols; c++) {
+      const gi = r * grid.cols + c;
+      if (Number.isFinite(grid.values[gi])) continue;
+      const x = d.minX + c / (grid.cols - 1) * d.groundW;
+      if (x < minX - 1e-6 || x > maxX + 1e-6) continue;
+      const cf = (x - minX) / step;
+      const c0 = Math.floor(cf), tx = cf - c0;
+      const v00 = at(c0, r0), v10 = at(c0 + 1, r0), v01 = at(c0, r0 + 1), v11 = at(c0 + 1, r0 + 1);
+      let v = NaN;
+      if (valid(v00) && valid(v10) && valid(v01) && valid(v11)) {
+        const a = v00 * (1 - tx) + v10 * tx;
+        const b = v01 * (1 - tx) + v11 * tx;
+        v = a * (1 - ty) + b * ty;
+      } else {
+        const vals = [v00, v10, v01, v11].filter(valid);
+        if (vals.length) v = vals.reduce((a,b) => a+b, 0) / vals.length;
+      }
+      if (!valid(v)) continue;
+      grid.sums[gi] += v;
+      grid.counts[gi] += 1;
+      grid.values[gi] = grid.sums[gi] / grid.counts[gi];
+      written++;
+    }
+  }
+  return written;
+}
+
 async function recoverWithSwissAltiRegio(grid, d, progressBase = 91) {
   const before = terrainStats(grid).missing;
-  if (!before) return { recovered: 0, items: 0, assetsTried: 0 };
+  if (!before) return { recovered: 0, items: 0, assetsTried: 0, xyzTried: 0, cogTried: 0 };
   const bbox = stacBboxForDims(d, 1000);
   setStatus('Grenzgebiet: swissALTIRegio-Fallback suchen', progressBase);
   const items = await fetchStacItemsForBbox(bbox, REGIO_ITEMS, 'swissALTIRegio');
-  const candidates = [];
+
+  // First choice: official 10×10-km XYZ tiles. They are much more reliable
+  // from a static GitHub-Pages app than byte-range reads against the national COG.
+  const xyzCandidates = [];
+  const seenXyz = new Set();
   for (const item of items) {
-    const asset = findAnyGeoTiffAsset(item);
-    if (asset) candidates.push({ item, asset });
-  }
-  candidates.sort((a, b) => itemYear(b.item) - itemYear(a.item));
-  let tried = 0;
-  for (const candidate of candidates) {
-    if (!terrainStats(grid).missing) break;
-    tried++;
-    try {
-      // The complete swissALTIRegio COG is huge: never download it fully.
-      await sampleTile(candidate.asset.href, d, grid, 10, { onlyMissing: true, forceRange: true });
-    } catch (err) {
-      debug(`swissALTIRegio ${candidate.item.id || tried}: ${err.message}`);
+    for (const asset of findRegioXyzAssets(item)) {
+      const href = String(asset.href || '');
+      if (!href || seenXyz.has(href)) continue;
+      seenXyz.add(href);
+      xyzCandidates.push({ item, asset });
     }
   }
-  return { recovered: before - terrainStats(grid).missing, items: items.length, assetsTried: tried };
+  xyzCandidates.sort((a, b) => itemYear(b.item) - itemYear(a.item));
+  let xyzTried = 0, cogTried = 0;
+  for (const candidate of xyzCandidates) {
+    if (!terrainStats(grid).missing) break;
+    xyzTried++;
+    try {
+      const added = await sampleRegioXyzAsset(candidate.asset.href, d, grid);
+      if (added) debug(`swissALTIRegio XYZ ${candidate.item.id || xyzTried}: ${added.toLocaleString('de-CH')} Punkte ergänzt.`);
+    } catch (err) {
+      debug(`swissALTIRegio XYZ ${candidate.item.id || xyzTried}: ${err.message}`);
+    }
+  }
+
+  // Last resort only: the single national COG. It is ~12 GB, so GeoTIFF.js
+  // must use HTTP range requests; some browser/CDN combinations reject them.
+  if (terrainStats(grid).missing) {
+    const cogCandidates = [];
+    const seenCog = new Set();
+    for (const item of items) {
+      const asset = findAnyGeoTiffAsset(item);
+      const href = String(asset?.href || '');
+      if (asset && href && !seenCog.has(href)) {
+        seenCog.add(href);
+        cogCandidates.push({ item, asset });
+      }
+    }
+    cogCandidates.sort((a, b) => itemYear(b.item) - itemYear(a.item));
+    for (const candidate of cogCandidates) {
+      if (!terrainStats(grid).missing) break;
+      cogTried++;
+      try {
+        await sampleTile(candidate.asset.href, d, grid, 10, { onlyMissing: true, forceRange: true });
+      } catch (err) {
+        debug(`swissALTIRegio COG ${candidate.item.id || cogTried}: ${err.message}`);
+      }
+    }
+  }
+  return {
+    recovered: before - terrainStats(grid).missing,
+    items: items.length,
+    assetsTried: xyzTried + cogTried,
+    xyzTried,
+    cogTried
+  };
 }
 
 function terrainStats(grid) {
@@ -880,7 +1036,7 @@ async function generateTerrain() {
     if (afterAlti3d.missing > 0) {
       debug(`${afterAlti3d.missing.toLocaleString('de-CH')} Punkte weiterhin ohne swissALTI³D-Abdeckung. swissALTIRegio (10 m) wird als Grenzgebiets-Fallback versucht.`);
       regioRecovery = await recoverWithSwissAltiRegio(grid, d, 91);
-      debug(`swissALTIRegio: ${regioRecovery.recovered.toLocaleString('de-CH')} Punkte ergänzt (${regioRecovery.items} STAC-Items, ${regioRecovery.assetsTried} Asset(s) geprüft).`);
+      debug(`swissALTIRegio: ${regioRecovery.recovered.toLocaleString('de-CH')} Punkte ergänzt (${regioRecovery.items} STAC-Items; XYZ: ${regioRecovery.xyzTried || 0}, COG: ${regioRecovery.cogTried || 0} geprüft).`);
     }
 
     // Interpolate only genuinely isolated residual NoData cells after every
