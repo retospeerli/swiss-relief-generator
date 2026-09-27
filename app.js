@@ -1,9 +1,12 @@
 import * as THREE from 'three';
 import { OrbitControls } from 'https://cdn.jsdelivr.net/npm/three@0.180.0/examples/jsm/controls/OrbitControls.js';
+import { GLTFLoader } from 'https://cdn.jsdelivr.net/npm/three@0.180.0/examples/jsm/loaders/GLTFLoader.js';
+import { DRACOLoader } from 'https://cdn.jsdelivr.net/npm/three@0.180.0/examples/jsm/loaders/DRACOLoader.js';
 
 const STAC_COLLECTION = 'ch.swisstopo.swissalti3d';
 const STAC_ITEMS = `https://data.geo.admin.ch/api/stac/v1/collections/${STAC_COLLECTION}/items`;
 const REGIO_COLLECTION = 'ch.swisstopo.swissaltiregio';
+const APP_VERSION = '0.6.7';
 const REGIO_ITEMS = `https://data.geo.admin.ch/api/stac/v1/collections/${REGIO_COLLECTION}/items`;
 const MAX_TILES = 1600;
 const MAX_STAC_PAGES = 120;
@@ -866,6 +869,19 @@ async function loadBuildingTriangles(t) {
 
   const TilesRenderer = await getTilesRendererClass();
   const tiles = new TilesRenderer(BUILDINGS_TILESET);
+
+  // swissBUILDINGS³D currently delivers Draco-compressed glTF payloads inside
+  // B3DM tiles. 3d-tiles-renderer delegates embedded glTF/GLB decoding to its
+  // LoadingManager, so install one shared GLTFLoader with a DRACOLoader here.
+  // Without this every tile fails with "No DRACOLoader instance provided".
+  const dracoLoader = new DRACOLoader(tiles.manager);
+  dracoLoader.setDecoderPath('https://cdn.jsdelivr.net/npm/three@0.180.0/examples/jsm/libs/draco/gltf/');
+  dracoLoader.setWorkerLimit(4);
+  const gltfLoader = new GLTFLoader(tiles.manager);
+  gltfLoader.setDRACOLoader(dracoLoader);
+  tiles.manager.addHandler(/\.(gltf|glb)(\?.*)?$/i, gltfLoader);
+  debug('Gebäude-Decoder: Draco aktiviert (three 0.180.0).');
+
   tiles.setCamera(tileCam);
   tiles.setResolution(tileCam, 1600, 1600);
   if ('errorTarget' in tiles) tiles.errorTarget = 2.5;
@@ -917,6 +933,7 @@ async function loadBuildingTriangles(t) {
   }
   debug(`swissBUILDINGS³D: ${meshes.length} auswertbare Meshes aus ${loadedRoots.size} geladenen Tile-Szenen (${loadedEvents} Tile-Ladevorgänge).`);
   if (!meshes.length) {
+    dracoLoader.dispose?.();
     tiles.dispose?.();
     throw new Error(`Gebäude waren aktiviert, aber swissBUILDINGS³D lieferte keine auswertbaren Meshes (Tile-Ladevorgänge: ${loadedEvents}).`);
   }
@@ -938,6 +955,7 @@ async function loadBuildingTriangles(t) {
     if(diffs.length>80000) break;
   }
   if (!diffs.length) {
+    dracoLoader.dispose?.();
     tiles.dispose?.();
     throw new Error('Gebäudedaten liegen ausserhalb des gewählten Reliefausschnitts.');
   }
