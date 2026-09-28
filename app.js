@@ -969,12 +969,13 @@ async function loadBuildingTriangles(t) {
   const baseMm=Number(els.baseThickness.value);
   const zExag=Number(els.zExaggeration.value);
   const embedMm=0.18;
+  const typicalHeightMm=BUILDING_TYPICAL_HEIGHT_M*t.dims.mmPerMeter;
+  // A true foundation vertex should lie close to the terrain. Eaves and gable
+  // shoulders are substantially higher and must never be pulled down. The
+  // tolerance scales with print scale so steep-slope downhill foundations are
+  // still caught without mistaking roof/eave vertices for the building base.
+  const foundationBandMm=Math.max(0.35, Math.min(2.2, typicalHeightMm*0.45));
 
-  // Keep the swissBUILDINGS geometry rigid in Z. The former implementation
-  // rebuilt every vertex relative to the terrain directly underneath it. On a
-  // slope that warps walls/roofs and can leave the downhill wall base floating.
-  // We now map the corrected absolute building elevation first, then only
-  // extend LOWER vertices of near-vertical facade triangles down into terrain.
   const toModel=(v)=>{
     const [lo,la,h]=ecefToGeodetic(v.x,v.y,v.z);
     const [x,y]=lv95FromLonLat(lo,la);
@@ -987,51 +988,59 @@ async function loadBuildingTriangles(t) {
     return {x,y,terr,correctedH,terrainZ,p:[xm,ym,rawZ]};
   };
 
-  const extendFacadeIntoTerrain=(A,B,C)=>{
-    const ax=B.p[0]-A.p[0], ay=B.p[1]-A.p[1], az=B.p[2]-A.p[2];
-    const bx=C.p[0]-A.p[0], by=C.p[1]-A.p[1], bz=C.p[2]-A.p[2];
-    const nx=ay*bz-az*by, ny=az*bx-ax*bz, nz=ax*by-ay*bx;
-    const nlen=Math.hypot(nx,ny,nz) || 1;
-    const verticality=Math.abs(nz)/nlen; // 0 = vertical facade, 1 = horizontal roof/floor
-    if(verticality>0.45) return;
-
-    const verts=[A,B,C];
-    const zs=verts.map(v=>v.p[2]);
-    const zMin=Math.min(...zs), zMax=Math.max(...zs);
-    const span=zMax-zMin;
-    if(span<0.15) return;
-
-    // In a triangulated wall, bottom vertices are the lower one/two vertices.
-    // Stretch only those to a little below the local terrain. This creates a
-    // printable foundation skirt while preserving roof and upper facade shape.
-    const lowerCut=zMin+span*0.38;
-    for(const v of verts){
-      if(v.p[2] <= lowerCut + 1e-6){
-        const target=v.terrainZ-embedMm;
-        if(v.p[2] > target){
-          v.p[2]=target;
-          foundationVertices++;
-        }
-      }
-    }
-  };
-
   for(const mesh of meshes){
     const pos=mesh.geometry.attributes.position, idx=mesh.geometry.index;
+    // Transform every mesh vertex exactly once. This keeps all triangles that
+    // share a vertex watertight after the foundation correction.
+    const verts=new Array(pos.count);
+    for(let vi=0;vi<pos.count;vi++){
+      va.fromBufferAttribute(pos,vi).applyMatrix4(mesh.matrixWorld);
+      verts[vi]=toModel(va);
+    }
+
+    // First pass: identify ONLY genuine foundation vertices on near-vertical
+    // facade triangles. The old triangle-local minimum test also selected the
+    // two eave corners of triangular gable faces and pulled them downward,
+    // opening a gap between wall and roof.
+    const foundationIdx=new Set();
     const ntri=idx ? Math.floor(idx.count/3) : Math.floor(pos.count/3);
     for(let ti=0;ti<ntri;ti++){
       const ia=idx?idx.getX(ti*3):ti*3, ib=idx?idx.getX(ti*3+1):ti*3+1, ic=idx?idx.getX(ti*3+2):ti*3+2;
-      va.fromBufferAttribute(pos,ia).applyMatrix4(mesh.matrixWorld);
-      vb.fromBufferAttribute(pos,ib).applyMatrix4(mesh.matrixWorld);
-      vc.fromBufferAttribute(pos,ic).applyMatrix4(mesh.matrixWorld);
-      const A=toModel(va),B=toModel(vb),C=toModel(vc);
+      const A=verts[ia],B=verts[ib],C=verts[ic];
+      const ax=B.p[0]-A.p[0], ay=B.p[1]-A.p[1], az=B.p[2]-A.p[2];
+      const bx=C.p[0]-A.p[0], by=C.p[1]-A.p[1], bz=C.p[2]-A.p[2];
+      const nx=ay*bz-az*by, ny=az*bx-ax*bz, nz=ax*by-ay*bx;
+      const nlen=Math.hypot(nx,ny,nz) || 1;
+      const verticality=Math.abs(nz)/nlen;
+      if(verticality>0.45) continue;
+      for(const vi of [ia,ib,ic]){
+        const v=verts[vi];
+        const aboveTerrain=v.p[2]-v.terrainZ;
+        if(aboveTerrain>=-0.25 && aboveTerrain<=foundationBandMm){
+          foundationIdx.add(vi);
+        }
+      }
+    }
+
+    // Apply the correction once per shared vertex. Roof, eave and gable-top
+    // vertices are outside the foundation band and therefore remain untouched.
+    for(const vi of foundationIdx){
+      const v=verts[vi];
+      const target=v.terrainZ-embedMm;
+      if(v.p[2]>target){ v.p[2]=target; foundationVertices++; }
+    }
+
+    // Second pass: write triangles using the same corrected shared vertices.
+    for(let ti=0;ti<ntri;ti++){
+      const ia=idx?idx.getX(ti*3):ti*3, ib=idx?idx.getX(ti*3+1):ti*3+1, ic=idx?idx.getX(ti*3+2):ti*3+2;
+      const A=verts[ia],B=verts[ib],C=verts[ic];
       const cx=(A.x+B.x+C.x)/3, cy=(A.y+B.y+C.y)/3;
       if(cx<t.dims.minX||cx>t.dims.maxX||cy<t.dims.minY||cy>t.dims.maxY){clipped++;continue;}
-      extendFacadeIntoTerrain(A,B,C);
       out.push(...A.p,...B.p,...C.p); triCount++;
       if(triCount>BUILDING_MAX_TRIANGLES){ tiles.dispose?.(); throw new Error(`Zu viele Gebäudedreiecke (> ${BUILDING_MAX_TRIANGLES.toLocaleString('de-CH')}). Bitte einen kleineren Ausschnitt wählen oder Gebäude deaktivieren.`); }
     }
   }
+  debug(`Gebäude-Fundamentband: ${foundationBandMm.toFixed(2)} mm über lokalem Terrain.`);
   tiles.dispose?.();
   if (!triCount) throw new Error('Keine Gebäudedreiecke innerhalb des Reliefausschnitts gefunden.');
   debug(`Gebäude: ${triCount.toLocaleString('de-CH')} Dreiecke übernommen; ${clipped.toLocaleString('de-CH')} ausserhalb verworfen; ${foundationVertices.toLocaleString('de-CH')} Fassaden-Bodenpunkte ins Terrain verlängert.`);
