@@ -6,7 +6,7 @@ import { DRACOLoader } from 'https://cdn.jsdelivr.net/npm/three@0.180.0/examples
 const STAC_COLLECTION = 'ch.swisstopo.swissalti3d';
 const STAC_ITEMS = `https://data.geo.admin.ch/api/stac/v1/collections/${STAC_COLLECTION}/items`;
 const REGIO_COLLECTION = 'ch.swisstopo.swissaltiregio';
-const APP_VERSION = '0.6.7';
+const APP_VERSION = '0.6.8';
 const REGIO_ITEMS = `https://data.geo.admin.ch/api/stac/v1/collections/${REGIO_COLLECTION}/items`;
 const MAX_TILES = 1600;
 const MAX_STAC_PAGES = 120;
@@ -964,19 +964,58 @@ async function loadBuildingTriangles(t) {
   debug(`Gebäude-Höhenabgleich: lokaler Offset ≈ ${geoidOffset.toFixed(2)} m · Druck-Höhenfaktor ${heightFactor.toFixed(2)}×.`);
 
   const out=[];
-  let triCount=0, clipped=0;
+  let triCount=0, clipped=0, foundationVertices=0;
   const va=new THREE.Vector3(), vb=new THREE.Vector3(), vc=new THREE.Vector3();
+  const baseMm=Number(els.baseThickness.value);
+  const zExag=Number(els.zExaggeration.value);
+  const embedMm=0.18;
+
+  // Keep the swissBUILDINGS geometry rigid in Z. The former implementation
+  // rebuilt every vertex relative to the terrain directly underneath it. On a
+  // slope that warps walls/roofs and can leave the downhill wall base floating.
+  // We now map the corrected absolute building elevation first, then only
+  // extend LOWER vertices of near-vertical facade triangles down into terrain.
   const toModel=(v)=>{
     const [lo,la,h]=ecefToGeodetic(v.x,v.y,v.z);
     const [x,y]=lv95FromLonLat(lo,la);
     const terr=terrainElevationAtXY(t,x,y);
-    const rel=Math.max(0,h-geoidOffset-terr);
+    const correctedH=h-geoidOffset;
     const xm=(x-t.dims.minX)*t.dims.mmPerMeter-t.dims.widthMm/2;
     const ym=(y-t.dims.minY)*t.dims.mmPerMeter-t.dims.depthMm/2;
-    const terrainZ=Number(els.baseThickness.value)+(terr-t.stats.min)*t.dims.mmPerMeter*Number(els.zExaggeration.value);
-    const zm=terrainZ + rel*t.dims.mmPerMeter*heightFactor - 0.12;
-    return {x,y,p:[xm,ym,zm]};
+    const terrainZ=baseMm+(terr-t.stats.min)*t.dims.mmPerMeter*zExag;
+    const rawZ=baseMm+(correctedH-t.stats.min)*t.dims.mmPerMeter*zExag;
+    return {x,y,terr,correctedH,terrainZ,p:[xm,ym,rawZ]};
   };
+
+  const extendFacadeIntoTerrain=(A,B,C)=>{
+    const ax=B.p[0]-A.p[0], ay=B.p[1]-A.p[1], az=B.p[2]-A.p[2];
+    const bx=C.p[0]-A.p[0], by=C.p[1]-A.p[1], bz=C.p[2]-A.p[2];
+    const nx=ay*bz-az*by, ny=az*bx-ax*bz, nz=ax*by-ay*bx;
+    const nlen=Math.hypot(nx,ny,nz) || 1;
+    const verticality=Math.abs(nz)/nlen; // 0 = vertical facade, 1 = horizontal roof/floor
+    if(verticality>0.45) return;
+
+    const verts=[A,B,C];
+    const zs=verts.map(v=>v.p[2]);
+    const zMin=Math.min(...zs), zMax=Math.max(...zs);
+    const span=zMax-zMin;
+    if(span<0.15) return;
+
+    // In a triangulated wall, bottom vertices are the lower one/two vertices.
+    // Stretch only those to a little below the local terrain. This creates a
+    // printable foundation skirt while preserving roof and upper facade shape.
+    const lowerCut=zMin+span*0.38;
+    for(const v of verts){
+      if(v.p[2] <= lowerCut + 1e-6){
+        const target=v.terrainZ-embedMm;
+        if(v.p[2] > target){
+          v.p[2]=target;
+          foundationVertices++;
+        }
+      }
+    }
+  };
+
   for(const mesh of meshes){
     const pos=mesh.geometry.attributes.position, idx=mesh.geometry.index;
     const ntri=idx ? Math.floor(idx.count/3) : Math.floor(pos.count/3);
@@ -988,13 +1027,14 @@ async function loadBuildingTriangles(t) {
       const A=toModel(va),B=toModel(vb),C=toModel(vc);
       const cx=(A.x+B.x+C.x)/3, cy=(A.y+B.y+C.y)/3;
       if(cx<t.dims.minX||cx>t.dims.maxX||cy<t.dims.minY||cy>t.dims.maxY){clipped++;continue;}
+      extendFacadeIntoTerrain(A,B,C);
       out.push(...A.p,...B.p,...C.p); triCount++;
       if(triCount>BUILDING_MAX_TRIANGLES){ tiles.dispose?.(); throw new Error(`Zu viele Gebäudedreiecke (> ${BUILDING_MAX_TRIANGLES.toLocaleString('de-CH')}). Bitte einen kleineren Ausschnitt wählen oder Gebäude deaktivieren.`); }
     }
   }
   tiles.dispose?.();
   if (!triCount) throw new Error('Keine Gebäudedreiecke innerhalb des Reliefausschnitts gefunden.');
-  debug(`Gebäude: ${triCount.toLocaleString('de-CH')} Dreiecke übernommen; ${clipped.toLocaleString('de-CH')} ausserhalb verworfen.`);
+  debug(`Gebäude: ${triCount.toLocaleString('de-CH')} Dreiecke übernommen; ${clipped.toLocaleString('de-CH')} ausserhalb verworfen; ${foundationVertices.toLocaleString('de-CH')} Fassaden-Bodenpunkte ins Terrain verlängert.`);
   return { triangles:new Float32Array(out), meta:{ triangleCount:triCount, meshCount:meshes.length, heightFactor, geoidOffset } };
 }
 
