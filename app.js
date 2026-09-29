@@ -6,7 +6,7 @@ import { DRACOLoader } from 'https://cdn.jsdelivr.net/npm/three@0.180.0/examples
 const STAC_COLLECTION = 'ch.swisstopo.swissalti3d';
 const STAC_ITEMS = `https://data.geo.admin.ch/api/stac/v1/collections/${STAC_COLLECTION}/items`;
 const REGIO_COLLECTION = 'ch.swisstopo.swissaltiregio';
-const APP_VERSION = '0.6.16';
+const APP_VERSION = '0.6.17';
 const REGIO_ITEMS = `https://data.geo.admin.ch/api/stac/v1/collections/${REGIO_COLLECTION}/items`;
 const MAX_TILES = 1600;
 const MAX_STAC_PAGES = 120;
@@ -1083,6 +1083,163 @@ function buildValidatedCutLoops(segments, plane) {
   return {ok:true,loops,segments:clean};
 }
 
+
+function buildCutPaths(segments, plane) {
+  const clean=normalizeCutSegments(segments,plane);
+  if(!clean.length) return {ok:true,paths:[],segments:clean};
+  const nodes=new Map(), edges=[];
+  const add=(v)=>{
+    const k=modelPointKey2D(v,plane);
+    if(!nodes.has(k)) nodes.set(k,{pt:v,edges:[]});
+    return k;
+  };
+  for(const seg of clean){
+    const a=add(seg[0]), b=add(seg[1]);
+    if(a===b) continue;
+    const ei=edges.length;
+    edges.push({a,b,used:false});
+    nodes.get(a).edges.push(ei); nodes.get(b).edges.push(ei);
+  }
+  // A sliced shell may legitimately be open at the building foundation. We
+  // accept degree 1 endpoints and degree 2 chain vertices. Branches indicate
+  // ambiguous/non-manifold source geometry and are rejected here.
+  for(const n of nodes.values()) if(n.edges.length<1 || n.edges.length>2) return {ok:false,paths:[],segments:clean};
+
+  const paths=[];
+  const walk=(startKey,startEdge)=>{
+    const path=[nodes.get(startKey).pt];
+    let curr=startKey, edgeIdx=startEdge, guard=0;
+    while(edgeIdx!=null && guard++<100000){
+      const e=edges[edgeIdx];
+      if(e.used) break;
+      e.used=true;
+      const next=e.a===curr?e.b:e.a;
+      path.push(nodes.get(next).pt);
+      curr=next;
+      const opts=nodes.get(curr).edges.filter(ei=>!edges[ei].used);
+      edgeIdx=opts.length?opts[0]:null;
+      if(curr===startKey) break;
+    }
+    return {points:path,closed:curr===startKey};
+  };
+
+  // Open chains first, starting at degree-1 endpoints.
+  for(const [k,n] of nodes){
+    if(n.edges.length!==1) continue;
+    const ei=n.edges.find(e=>!edges[e].used);
+    if(ei!=null) paths.push(walk(k,ei));
+  }
+  // Remaining edges are closed loops.
+  for(let i=0;i<edges.length;i++){
+    if(edges[i].used) continue;
+    paths.push(walk(edges[i].a,i));
+  }
+  if(edges.some(e=>!e.used)) return {ok:false,paths:[],segments:clean};
+  return {ok:true,paths,segments:clean};
+}
+
+function borderTerrainPoint(t, plane, uMm) {
+  const baseMm=Number(els.baseThickness.value);
+  const zExag=Number(els.zExaggeration.value);
+  let x,y,px,py;
+  if(plane.axis===0){
+    x=plane.coord<0 ? t.dims.minX : t.dims.maxX;
+    y=t.dims.minY + (uMm + t.dims.depthMm/2) / t.dims.mmPerMeter;
+    px=plane.coord; py=uMm;
+  } else {
+    y=plane.coord<0 ? t.dims.minY : t.dims.maxY;
+    x=t.dims.minX + (uMm + t.dims.widthMm/2) / t.dims.mmPerMeter;
+    px=uMm; py=plane.coord;
+  }
+  x=Math.max(t.dims.minX,Math.min(t.dims.maxX,x));
+  y=Math.max(t.dims.minY,Math.min(t.dims.maxY,y));
+  const terr=terrainElevationAtXY(t,x,y);
+  const z=baseMm+(terr-t.stats.min)*t.dims.mmPerMeter*zExag;
+  return {p:[px,py,z]};
+}
+
+function planeU(v,plane){ return plane.axis===0 ? v.p[1] : v.p[0]; }
+
+function sampleTerrainClosure(t, plane, uFrom, uTo) {
+  const span=Math.abs(uTo-uFrom);
+  // Sample finely enough to match the visible side-wall profile, without
+  // exploding triangle counts. The terrain mesh spacing is the natural scale.
+  const meshStepMm=Math.max(0.08, Math.min(0.5, t.dims.widthMm / Math.max(2,t.grid.cols-1)));
+  const n=Math.max(1,Math.ceil(span/meshStepMm));
+  const pts=[];
+  for(let i=0;i<=n;i++){
+    const f=i/n;
+    pts.push(borderTerrainPoint(t,plane,uFrom+(uTo-uFrom)*f));
+  }
+  return pts;
+}
+
+function compactCapContour(points, plane) {
+  const out=[];
+  const dist2=(a,b)=>{
+    const au=planeU(a,plane), bu=planeU(b,plane);
+    const dz=a.p[2]-b.p[2], du=au-bu;
+    return du*du+dz*dz;
+  };
+  for(const p of points){
+    if(!out.length || dist2(out[out.length-1],p)>1e-10) out.push(p);
+  }
+  if(out.length>2 && dist2(out[0],out[out.length-1])<1e-10) out.pop();
+  // Remove nearly collinear intermediate points in the 2D cut plane.
+  let changed=true;
+  while(changed && out.length>3){
+    changed=false;
+    for(let i=0;i<out.length;i++){
+      const a=out[(i-1+out.length)%out.length], b=out[i], c=out[(i+1)%out.length];
+      const ax=planeU(b,plane)-planeU(a,plane), ay=b.p[2]-a.p[2];
+      const bx=planeU(c,plane)-planeU(b,plane), by=c.p[2]-b.p[2];
+      const cross=Math.abs(ax*by-ay*bx);
+      const scale=Math.max(1e-9,Math.hypot(ax,ay)*Math.hypot(bx,by));
+      if(cross/scale<1e-7){ out.splice(i,1); changed=true; break; }
+    }
+  }
+  return out;
+}
+
+function appendTerrainClosedCaps(out, paths, plane, t) {
+  let count=0;
+  for(const pathInfo of paths){
+    let chain=pathInfo.points.slice();
+    if(pathInfo.closed && chain.length>1){
+      if(modelPointKey2D(chain[0],plane)===modelPointKey2D(chain[chain.length-1],plane)) chain.pop();
+    }
+    if(chain.length<2) return {ok:false,count};
+    let contour;
+    if(pathInfo.closed){
+      contour=chain;
+    } else {
+      const a=chain[0], b=chain[chain.length-1];
+      const ua=planeU(a,plane), ub=planeU(b,plane);
+      const terrB=borderTerrainPoint(t,plane,ub);
+      const terrA=borderTerrainPoint(t,plane,ua);
+      // Cross-section follows the actual building shell from A→B, then drops
+      // vertically to the terrain and follows the exact relief edge back to A.
+      const ground=sampleTerrainClosure(t,plane,ub,ua);
+      contour=[...chain,terrB,...ground.slice(1,-1),terrA];
+    }
+    contour=compactCapContour(contour,plane);
+    if(contour.length<3) return {ok:false,count};
+    const pts2=contour.map(v=>plane.axis===0 ? new THREE.Vector2(v.p[1],v.p[2]) : new THREE.Vector2(v.p[0],v.p[2]));
+    const tris=THREE.ShapeUtils.triangulateShape(pts2,[]);
+    if(!tris.length) return {ok:false,count};
+    for(const tr of tris){
+      const A=contour[tr[0]].p.slice(),B=contour[tr[1]].p.slice(),C=contour[tr[2]].p.slice();
+      const ux=B[0]-A[0],uy=B[1]-A[1],uz=B[2]-A[2];
+      const vx=C[0]-A[0],vy=C[1]-A[1],vz=C[2]-A[2];
+      const nx=uy*vz-uz*vy, ny=uz*vx-ux*vz;
+      const sign=plane.outward==='negx'?-nx:plane.outward==='posx'?nx:plane.outward==='negy'?-ny:ny;
+      if(sign<0) out.push(...A,...C,...B); else out.push(...A,...B,...C);
+      count++;
+    }
+  }
+  return {ok:true,count};
+}
+
 function appendValidatedCaps(out, loopSets, plane) {
   let count=0;
   for(const loop of loopSets){
@@ -1460,67 +1617,50 @@ async function loadBuildingTriangles(t) {
         for(let i=1;i<poly.length-1;i++) temp.push(...poly[0].p,...poly[i].p,...poly[i+1].p);
       }
 
-      // Schnittkonturen pro Haus und pro Reliefseite validieren. Nur geschlossene,
-      // zweifach verbundene Konturen werden trianguliert. Das verhindert offene
-      // Fassaden oder eine Rückwand, die zu einem benachbarten Haus gehört.
+      // Die swissBUILDINGS³D-Hülle ist am Gebäudeboden häufig offen. Deshalb
+      // entsteht am Reliefrahmen keine geschlossene Ringkontur, sondern eine
+      // offene Kette zwischen zwei Fundamentpunkten. Diese wird exakt auf der
+      // Relief-Seitenebene bis zur lokalen Terrainkante geschlossen. So bildet
+      // die neue Schnittfassade unten eine einzige Fläche mit dem Reliefrand.
       let valid=true, localCaps=0;
       for(const plane of modelClipPlanes){
-        const info=buildValidatedCutLoops(segs[plane.name],plane);
+        const info=buildCutPaths(segs[plane.name],plane);
         if(!info.ok){ valid=false; break; }
-        const cap=appendValidatedCaps(temp,info.loops,plane);
+        const cap=appendTerrainClosedCaps(temp,info.paths,plane,t);
         if(!cap.ok){ valid=false; break; }
         localCaps+=cap.count;
       }
 
-      // Zusätzliche harte Kontrolle: Nach einem gültigen Schnitt darf kein Punkt
-      // mehr ausserhalb des Reliefrahmens liegen.
+      // Harte Kontrolle: Kein ausgegebener Randhauspunkt darf ausserhalb liegen.
       if(valid){
         for(let i=0;i<temp.length;i+=3){
           const x=temp[i], y=temp[i+1];
-          if(x<bx0-1e-4||x>bx1+1e-4||y<by0-1e-4||y>by1+1e-4){valid=false;break;}
+          if(x<bx0-1e-5||x>bx1+1e-5||y<by0-1e-5||y>by1+1e-5){valid=false;break;}
         }
       }
-
-      // Ein tatsächlich geschnittenes Randhaus MUSS mindestens eine geschlossene
-      // Schnittfläche erzeugen. Ohne Cap wäre es kein druckbarer geschlossener
-      // Körper; in diesem Fall lieber den ausdrücklich gewünschten Vollhaus-
-      // Fallback statt eines offenen STL-Fragments.
       if(localCaps===0) valid=false;
 
-      if(valid && temp.length){
-        out.push(...temp);
-        const added=Math.floor(temp.length/9);
-        triCount+=added;
-        capTriangles+=localCaps;
-        clippedTriangles+=localClipped;
-      } else {
-        // Zweite, streng getrennte Stufe: Das vollständige, druckfähige Haus wird
-        // als Solid per Boolean-INTERSECTION mit einem rechteckigen Relief-Prisma
-        // beschnitten. Der Boolean erzeugt die Rückwand / Schnittfläche selbst.
-        // Nur falls auch dieser robuste Nachschnitt scheitert, bleibt das ganze
-        // Haus als letzter druckfähiger Sicherheits-Fallback stehen.
-        const full=[];
-        for(const [ia,ib,ic] of tris) full.push(...verts[ia].p,...verts[ib].p,...verts[ic].p);
-        try {
-          const cropped = await hardCropBuildingSolid(full, t);
-          out.push(...cropped);
-          triCount += Math.floor(cropped.length / 9);
-          borderHardCropped++;
-        } catch (cropErr) {
-          borderHardCropFailed++;
-          borderFallbackFull++;
-          debug(`Randhaus Solid-Nachschnitt fehlgeschlagen: ${cropErr?.message || cropErr}`);
-          out.push(...full);
-          triCount += Math.floor(full.length / 9);
-        }
+      if(!valid || !temp.length){
+        // Kein Vollhaus-Fallback mehr: ein über den Reliefrahmen ragendes Haus
+        // darf niemals ausgegeben werden. Lieber gezielt dieses Randhaus
+        // verwerfen als ein geometrisch falsches, überstehendes Modell erzeugen.
+        borderHardCropFailed++;
+        debug('Randhaus konnte nicht eindeutig geschlossen werden und wurde verworfen (kein Vollhaus-Fallback).');
+        continue;
       }
+      out.push(...temp);
+      const added=Math.floor(temp.length/9);
+      triCount+=added;
+      capTriangles+=localCaps;
+      clippedTriangles+=localClipped;
+      borderHardCropped++;
       if(triCount>BUILDING_MAX_TRIANGLES){ tiles.dispose?.(); throw new Error(`Zu viele Gebäudedreiecke (> ${BUILDING_MAX_TRIANGLES.toLocaleString('de-CH')}). Bitte einen kleineren Ausschnitt wählen oder Gebäude deaktivieren.`); }
     }
   }
   debug(`Gebäude-Fundamentband: ${foundationBandMm.toFixed(2)} mm über lokalem Terrain.`);
   tiles.dispose?.();
   if (!triCount) throw new Error('Keine Gebäudedreiecke innerhalb des Reliefausschnitts gefunden.');
-  debug(`Gebäude: ${triCount.toLocaleString('de-CH')} Dreiecke übernommen; ${borderBuildingsClipped.toLocaleString('de-CH')} Randhäuser bearbeitet; ${capTriangles.toLocaleString('de-CH')} Abschluss-Dreiecke im Primärschnitt; Solid-Nachschnitt erfolgreich: ${borderHardCropped.toLocaleString('de-CH')}; Solid-Nachschnitt fehlgeschlagen: ${borderHardCropFailed.toLocaleString('de-CH')}; Fallback vollständig: ${borderFallbackFull.toLocaleString('de-CH')}; ${foundationVertices.toLocaleString('de-CH')} Fassaden-Bodenpunkte ins Terrain verlängert.`);
+  debug(`Gebäude: ${triCount.toLocaleString('de-CH')} Dreiecke übernommen; ${borderBuildingsClipped.toLocaleString('de-CH')} Randhäuser bearbeitet; ${capTriangles.toLocaleString('de-CH')} Abschluss-Dreiecke im Primärschnitt; Randhäuser exakt gekappt/geschlossen: ${borderHardCropped.toLocaleString('de-CH')}; Randhäuser verworfen statt überstehend ausgegeben: ${borderHardCropFailed.toLocaleString('de-CH')}; ${foundationVertices.toLocaleString('de-CH')} Fassaden-Bodenpunkte ins Terrain verlängert.`);
   return { triangles:new Float32Array(out), meta:{ triangleCount:triCount, meshCount:meshes.length, heightFactor, geoidOffset } };
 }
 
