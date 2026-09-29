@@ -6,7 +6,7 @@ import { DRACOLoader } from 'https://cdn.jsdelivr.net/npm/three@0.180.0/examples
 const STAC_COLLECTION = 'ch.swisstopo.swissalti3d';
 const STAC_ITEMS = `https://data.geo.admin.ch/api/stac/v1/collections/${STAC_COLLECTION}/items`;
 const REGIO_COLLECTION = 'ch.swisstopo.swissaltiregio';
-const APP_VERSION = '0.6.17';
+const APP_VERSION = '0.6.18';
 const REGIO_ITEMS = `https://data.geo.admin.ch/api/stac/v1/collections/${REGIO_COLLECTION}/items`;
 const MAX_TILES = 1600;
 const MAX_STAC_PAGES = 120;
@@ -1363,18 +1363,39 @@ async function loadBuildingTriangles(t) {
 
   const b = selectedBounds;
   const center = b.getCenter();
-  const centerEcef = geodeticToEcef(center.lng, center.lat, 0);
+  const [centerX, centerY] = lv95FromLonLat(center.lng, center.lat);
+  const centerTerrain = terrainElevationAtXY(t, centerX, centerY);
+  // The building tiles are ECEF / ellipsoidal. LN02 terrain heights differ from
+  // ellipsoidal heights by roughly a few dozen metres in Switzerland. We do not
+  // yet know the exact local geoid offset (it is estimated after tiles load),
+  // so add a safe 60 m only for camera placement. The camera target must sit at
+  // the actual terrain level; v0.6.17 targeted h=0 and used a minimum camera
+  // height of 1200 m, which can put the camera below alpine terrain and yield
+  // exactly 0 tile loads.
+  const cameraTargetH = centerTerrain + 60;
+  const centerEcef = geodeticToEcef(center.lng, center.lat, cameraTargetH);
   const up = centerEcef.clone().normalize();
   const lon = center.lng * Math.PI/180, lat = center.lat * Math.PI/180;
   const north = new THREE.Vector3(-Math.sin(lat)*Math.cos(lon), -Math.sin(lat)*Math.sin(lon), Math.cos(lat)).normalize();
   const span = Math.max(t.dims.groundW, t.dims.groundH);
-  const altitude = Math.max(1200, span * 1.25);
-  const tileCam = new THREE.PerspectiveCamera(58, Math.max(.4, t.dims.groundW/t.dims.groundH), 10, Math.max(50000, altitude*5));
-  tileCam.position.copy(centerEcef).addScaledVector(up, altitude);
-  tileCam.up.copy(north);
-  tileCam.lookAt(centerEcef);
-  tileCam.updateProjectionMatrix();
-  tileCam.updateMatrixWorld(true);
+  const baseClearance = Math.max(1200, span * 1.35);
+  const tileCam = new THREE.PerspectiveCamera(62, Math.max(.4, t.dims.groundW/t.dims.groundH), 10, Math.max(80000, (cameraTargetH + baseClearance) * 6));
+  const setTileCameraPose = (clearance, eastFrac=0, northFrac=0) => {
+    const east = new THREE.Vector3(-Math.sin(lon), Math.cos(lon), 0).normalize();
+    const target = centerEcef.clone()
+      .addScaledVector(east, span * eastFrac)
+      .addScaledVector(north, span * northFrac);
+    const localUp = target.clone().normalize();
+    tileCam.position.copy(target).addScaledVector(localUp, clearance);
+    tileCam.up.copy(north);
+    tileCam.lookAt(target);
+    tileCam.near = 10;
+    tileCam.far = Math.max(80000, clearance * 8 + span * 4);
+    tileCam.updateProjectionMatrix();
+    tileCam.updateMatrixWorld(true);
+  };
+  setTileCameraPose(baseClearance);
+  debug(`Gebäude-Kamera: Terrainzentrum ≈ ${centerTerrain.toFixed(1)} m ü. M. · Zielhöhe ≈ ${cameraTargetH.toFixed(1)} m · Grundabstand ${Math.round(baseClearance)} m.`);
 
   const TilesRenderer = await getTilesRendererClass();
   const tiles = new TilesRenderer(BUILDINGS_TILESET);
@@ -1393,7 +1414,7 @@ async function loadBuildingTriangles(t) {
 
   tiles.setCamera(tileCam);
   tiles.setResolution(tileCam, 1600, 1600);
-  if ('errorTarget' in tiles) tiles.errorTarget = 2.5;
+  if ('errorTarget' in tiles) tiles.errorTarget = 3.0;
   if (tiles.lruCache) {
     if ('maxSize' in tiles.lruCache) tiles.lruCache.maxSize = Math.max(tiles.lruCache.maxSize || 0, 1200);
     if ('maxBytesSize' in tiles.lruCache) tiles.lruCache.maxBytesSize = Math.max(tiles.lruCache.maxBytesSize || 0, 700e6);
@@ -1414,14 +1435,58 @@ async function loadBuildingTriangles(t) {
   });
   const tmpScene = new THREE.Scene();
   tmpScene.add(tiles.group);
-  for (let i=0; i<180; i++) {
-    tileCam.updateMatrixWorld(true);
-    tiles.group.updateMatrixWorld(true);
-    tiles.update();
-    await sleep(80);
-    if (loadedEvents === lastEvents) stable++; else stable=0;
-    lastEvents=loadedEvents;
-    if (i > 25 && stable > 18) break;
+
+  // Robust camera search. Most locations load on the first pass. If a location
+  // yields zero requests, retry from higher / slightly shifted viewpoints.
+  // This is intentionally only a tile-discovery change; all geometry handling
+  // below stays identical to v0.6.17.
+  const cameraAttempts = [
+    { clearance:baseClearance,     e:0,     n:0,     label:'zentral 1×' },
+    { clearance:baseClearance*2.0, e:0,     n:0,     label:'zentral 2×' },
+    { clearance:baseClearance*3.5, e:0,     n:0,     label:'zentral 3.5×' },
+    { clearance:baseClearance*2.2, e: 0.35, n:0,     label:'Ost versetzt' },
+    { clearance:baseClearance*2.2, e:-0.35, n:0,     label:'West versetzt' },
+    { clearance:baseClearance*2.2, e:0,     n: 0.35, label:'Nord versetzt' },
+    { clearance:baseClearance*2.2, e:0,     n:-0.35, label:'Süd versetzt' }
+  ];
+
+  for (let ai=0; ai<cameraAttempts.length; ai++) {
+    const a = cameraAttempts[ai];
+    const before = loadedEvents;
+    setTileCameraPose(a.clearance, a.e, a.n);
+    tiles.setResolution(tileCam, ai === 0 ? 1600 : 1200, ai === 0 ? 1600 : 1200);
+    if ('errorTarget' in tiles) tiles.errorTarget = ai === 0 ? 3.0 : 5.0;
+    tiles.resetFailedTiles?.();
+    stable = 0; lastEvents = loadedEvents;
+    for (let i=0; i<90; i++) {
+      tileCam.updateMatrixWorld(true);
+      tiles.group.updateMatrixWorld(true);
+      tiles.update();
+      await sleep(80);
+      if (loadedEvents === lastEvents) stable++; else stable=0;
+      lastEvents=loadedEvents;
+      if (i > 18 && stable > 12) break;
+    }
+    const gained = loadedEvents - before;
+    debug(`Gebäude-Suche ${ai+1}/${cameraAttempts.length} · ${a.label} · Abstand ${Math.round(a.clearance)} m → ${gained} neue Tile-Ladevorgänge (gesamt ${loadedEvents}).`);
+    if (loadedEvents > 0) {
+      // Once the hierarchy is active, return to the accurate central view and
+      // allow a longer refinement pass so the requested small area gets detail.
+      setTileCameraPose(baseClearance);
+      tiles.setResolution(tileCam, 1800, 1800);
+      if ('errorTarget' in tiles) tiles.errorTarget = 2.5;
+      stable = 0; lastEvents = loadedEvents;
+      for (let i=0; i<120; i++) {
+        tileCam.updateMatrixWorld(true);
+        tiles.group.updateMatrixWorld(true);
+        tiles.update();
+        await sleep(70);
+        if (loadedEvents === lastEvents) stable++; else stable=0;
+        lastEvents=loadedEvents;
+        if (i > 25 && stable > 16) break;
+      }
+      break;
+    }
   }
   tiles.group.updateMatrixWorld(true);
 
