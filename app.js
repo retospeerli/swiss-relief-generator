@@ -6,7 +6,7 @@ import { DRACOLoader } from 'https://cdn.jsdelivr.net/npm/three@0.180.0/examples
 const STAC_COLLECTION = 'ch.swisstopo.swissalti3d';
 const STAC_ITEMS = `https://data.geo.admin.ch/api/stac/v1/collections/${STAC_COLLECTION}/items`;
 const REGIO_COLLECTION = 'ch.swisstopo.swissaltiregio';
-const APP_VERSION = '0.6.11';
+const APP_VERSION = '0.6.12';
 const REGIO_ITEMS = `https://data.geo.admin.ch/api/stac/v1/collections/${REGIO_COLLECTION}/items`;
 const MAX_TILES = 1600;
 const MAX_STAC_PAGES = 120;
@@ -845,6 +845,132 @@ function percentile(arr, q) {
   return a[pos];
 }
 
+
+function cloneClipVertex(v) {
+  return { x:v.x, y:v.y, p:[v.p[0], v.p[1], v.p[2]] };
+}
+
+function lerpClipVertex(a, b, t) {
+  return {
+    x: a.x + (b.x - a.x) * t,
+    y: a.y + (b.y - a.y) * t,
+    p: [
+      a.p[0] + (b.p[0] - a.p[0]) * t,
+      a.p[1] + (b.p[1] - a.p[1]) * t,
+      a.p[2] + (b.p[2] - a.p[2]) * t
+    ]
+  };
+}
+
+function makeBuildingClipPlanes(t) {
+  return [
+    { name:'xmin', axis:'x', coord:t.dims.minX, modelCoord:-t.dims.widthMm/2, keep:'ge', outward:'negx' },
+    { name:'xmax', axis:'x', coord:t.dims.maxX, modelCoord: t.dims.widthMm/2, keep:'le', outward:'posx' },
+    { name:'ymin', axis:'y', coord:t.dims.minY, modelCoord:-t.dims.depthMm/2, keep:'ge', outward:'negy' },
+    { name:'ymax', axis:'y', coord:t.dims.maxY, modelCoord: t.dims.depthMm/2, keep:'le', outward:'posy' }
+  ];
+}
+
+function clipInsidePlane(v, plane, eps = 1e-9) {
+  return plane.keep === 'ge' ? v[plane.axis] >= plane.coord - eps : v[plane.axis] <= plane.coord + eps;
+}
+
+function clipPolygonAgainstPlane(poly, plane, segmentsOut) {
+  if (!poly.length) return poly;
+  const out = [];
+  const intersections = [];
+  let prev = poly[poly.length - 1];
+  let prevIn = clipInsidePlane(prev, plane);
+  for (const curr of poly) {
+    const currIn = clipInsidePlane(curr, plane);
+    if (currIn !== prevIn) {
+      const denom = (curr[plane.axis] - prev[plane.axis]);
+      const t = Math.abs(denom) < 1e-12 ? 0 : (plane.coord - prev[plane.axis]) / denom;
+      const inter = lerpClipVertex(prev, curr, Math.max(0, Math.min(1, t)));
+      inter[plane.axis] = plane.coord;
+      if (plane.axis === 'x') inter.p[0] = plane.modelCoord;
+      else inter.p[1] = plane.modelCoord;
+      intersections.push(inter);
+      out.push(inter);
+    }
+    if (currIn) out.push(curr);
+    prev = curr; prevIn = currIn;
+  }
+  if (intersections.length === 2) segmentsOut.push([intersections[0], intersections[1]]);
+  return out;
+}
+
+function pointKey2D(v, plane, scale = 10000) {
+  const u = plane.axis === 'x' ? v.p[1] : v.p[0];
+  const w = v.p[2];
+  return `${Math.round(u * scale)}:${Math.round(w * scale)}`;
+}
+
+function buildCapLoopsFromSegments(segments, plane) {
+  const nodeMap = new Map();
+  const edges = [];
+  const addNode = (v) => {
+    const key = pointKey2D(v, plane);
+    if (!nodeMap.has(key)) nodeMap.set(key, { key, pt:v, edges:[] });
+    return nodeMap.get(key);
+  };
+  for (const seg of segments) {
+    const a = addNode(seg[0]), b = addNode(seg[1]);
+    if (a.key === b.key) continue;
+    const edge = { a:a.key, b:b.key, used:false };
+    const idx = edges.push(edge) - 1;
+    a.edges.push(idx); b.edges.push(idx);
+  }
+  const loops = [];
+  for (let i = 0; i < edges.length; i++) {
+    if (edges[i].used) continue;
+    const first = edges[i];
+    first.used = true;
+    let startKey = first.a;
+    let prevKey = first.a;
+    let currKey = first.b;
+    const loop = [nodeMap.get(startKey).pt, nodeMap.get(currKey).pt];
+    let guard = 0;
+    while (currKey !== startKey && guard++ < 10000) {
+      const node = nodeMap.get(currKey);
+      if (!node) break;
+      const nextEdgeIdx = node.edges.find(ei => !edges[ei].used && ((edges[ei].a === currKey && edges[ei].b !== prevKey) || (edges[ei].b === currKey && edges[ei].a !== prevKey)))
+        ?? node.edges.find(ei => !edges[ei].used);
+      if (nextEdgeIdx == null) break;
+      const e = edges[nextEdgeIdx];
+      e.used = true;
+      const nextKey = e.a === currKey ? e.b : e.a;
+      if (nextKey !== startKey) loop.push(nodeMap.get(nextKey).pt);
+      prevKey = currKey;
+      currKey = nextKey;
+    }
+    if (currKey === startKey && loop.length >= 3) loops.push(loop);
+  }
+  return loops;
+}
+
+function appendCapTrianglesForPlane(out, segments, plane) {
+  let count = 0;
+  const loops = buildCapLoopsFromSegments(segments, plane);
+  for (const loop of loops) {
+    const contour = loop.map(v => plane.axis === 'x' ? new THREE.Vector2(v.p[1], v.p[2]) : new THREE.Vector2(v.p[0], v.p[2]));
+    const tris = THREE.ShapeUtils.triangulateShape(contour, []);
+    for (const tri of tris) {
+      const A = loop[tri[0]].p.slice();
+      const B = loop[tri[1]].p.slice();
+      const C = loop[tri[2]].p.slice();
+      const ux = B[0] - A[0], uy = B[1] - A[1], uz = B[2] - A[2];
+      const vx = C[0] - A[0], vy = C[1] - A[1], vz = C[2] - A[2];
+      let nx = uy * vz - uz * vy, ny = uz * vx - ux * vz, nz = ux * vy - uy * vx;
+      const sign = plane.outward === 'negx' ? -nx : plane.outward === 'posx' ? nx : plane.outward === 'negy' ? -ny : ny;
+      if (sign < 0) out.push(...A, ...C, ...B);
+      else out.push(...A, ...B, ...C);
+      count++;
+    }
+  }
+  return count;
+}
+
 async function loadBuildingTriangles(t) {
   const elig = buildingEligibility(t.dims);
   if (!els.includeBuildings.checked || !elig.ok) return { triangles:null, meta:null };
@@ -964,8 +1090,9 @@ async function loadBuildingTriangles(t) {
   debug(`Gebäude-Höhenabgleich: lokaler Offset ≈ ${geoidOffset.toFixed(2)} m · Gebäudehöhe 1.00× (keine Relief-Überhöhung).`);
 
   const out=[];
-  let triCount=0, clipped=0, foundationVertices=0, borderBuildingsRemoved=0;
+  let triCount=0, clippedTriangles=0, capTriangles=0, foundationVertices=0, borderBuildingsClipped=0;
   const va=new THREE.Vector3(), vb=new THREE.Vector3(), vc=new THREE.Vector3();
+  const clipPlanes = makeBuildingClipPlanes(t);
   const baseMm=Number(els.baseThickness.value);
   const zExag=Number(els.zExaggeration.value);
   const embedMm=0.18;
@@ -1026,31 +1153,29 @@ async function loadBuildingTriangles(t) {
       if(v.x<b.minX) b.minX=v.x; if(v.x>b.maxX) b.maxX=v.x;
       if(v.y<b.minY) b.minY=v.y; if(v.y>b.maxY) b.maxY=v.y;
     }
-    // Drucksichere Randregel: Ein Gebäudekörper wird nur übernommen, wenn
-    // er vollständig innerhalb des Reliefrahmens liegt. Früher wurden nur
-    // einzelne Dreiecke ausserhalb verworfen; dadurch entstanden offene,
-    // nicht-manifold Randgebäude, die Slicer ablehnen konnten.
-    const borderMarginM=Math.max(0.02/t.dims.mmPerMeter, 0.05); // mind. 0.02 mm Sicherheitsabstand im Modell
-    const compKeep=new Map();
+    const borderMarginM=Math.max(0.01/t.dims.mmPerMeter, 0.02); // numerical tolerance only
+    const compMode=new Map();
     for(const [r,b] of compBounds){
+      const disjoint = b.maxX < t.dims.minX - borderMarginM || b.minX > t.dims.maxX + borderMarginM ||
+                       b.maxY < t.dims.minY - borderMarginM || b.minY > t.dims.maxY + borderMarginM;
+      if(disjoint){ compMode.set(r,'skip'); continue; }
       const inside = b.minX >= t.dims.minX + borderMarginM &&
                      b.maxX <= t.dims.maxX - borderMarginM &&
                      b.minY >= t.dims.minY + borderMarginM &&
                      b.maxY <= t.dims.maxY - borderMarginM;
-      compKeep.set(r,inside);
-      if(!inside) borderBuildingsRemoved++;
+      compMode.set(r, inside ? 'inside' : 'clip');
+      if(!inside) borderBuildingsClipped++;
     }
     const compRef=new Map();
     for(const [r,arr] of compTerr){
-      if(!compKeep.get(r)) continue;
+      if(compMode.get(r)==='skip') continue;
       arr.sort((a,b)=>a-b);
-      // Unteres Terrain-Quantil als robuste lokale Standhöhe des Gebäudes.
       const qi=Math.min(arr.length-1, Math.max(0, Math.floor(arr.length*0.15)));
       compRef.set(r,arr[qi]);
     }
     for(let vi=0;vi<verts.length;vi++){
       const r=find(vi);
-      if(!compKeep.get(r)) continue;
+      if(compMode.get(r)==='skip') continue;
       const refTerr=compRef.get(r);
       const exaggerationShift=(refTerr-t.stats.min)*t.dims.mmPerMeter*(zExag-1);
       verts[vi].p[2]+=exaggerationShift;
@@ -1064,7 +1189,7 @@ async function loadBuildingTriangles(t) {
     for(let ti=0;ti<ntri;ti++){
       const ia=idx?idx.getX(ti*3):ti*3, ib=idx?idx.getX(ti*3+1):ti*3+1, ic=idx?idx.getX(ti*3+2):ti*3+2;
       const r=find(ia);
-      if(!compKeep.get(r)) continue;
+      if(compMode.get(r)==='skip') continue;
       const A=verts[ia],B=verts[ib],C=verts[ic];
       const ax=B.p[0]-A.p[0], ay=B.p[1]-A.p[1], az=B.p[2]-A.p[2];
       const bx=C.p[0]-A.p[0], by=C.p[1]-A.p[1], bz=C.p[2]-A.p[2];
@@ -1089,20 +1214,42 @@ async function loadBuildingTriangles(t) {
       if(v.p[2]>target){ v.p[2]=target; foundationVertices++; }
     }
 
-    // Second pass: write triangles using the same corrected shared vertices.
+    // Second pass: keep all interior buildings as-is. Buildings crossing the
+    // relief frame are clipped against the rectangular model boundary and the
+    // cut sections are closed with watertight vertical cap faces, so all
+    // border buildings remain printable/manifold.
+    const planeSegments = { xmin:[], xmax:[], ymin:[], ymax:[] };
+    let meshCap = 0;
     for(let ti=0;ti<ntri;ti++){
       const ia=idx?idx.getX(ti*3):ti*3, ib=idx?idx.getX(ti*3+1):ti*3+1, ic=idx?idx.getX(ti*3+2):ti*3+2;
       const r=find(ia);
-      if(!compKeep.get(r)){ clipped++; continue; }
-      const A=verts[ia],B=verts[ib],C=verts[ic];
-      out.push(...A.p,...B.p,...C.p); triCount++;
-      if(triCount>BUILDING_MAX_TRIANGLES){ tiles.dispose?.(); throw new Error(`Zu viele Gebäudedreiecke (> ${BUILDING_MAX_TRIANGLES.toLocaleString('de-CH')}). Bitte einen kleineren Ausschnitt wählen oder Gebäude deaktivieren.`); }
+      const mode=compMode.get(r);
+      if(mode==='skip') continue;
+      let poly=[cloneClipVertex(verts[ia]), cloneClipVertex(verts[ib]), cloneClipVertex(verts[ic])];
+      if(mode==='clip'){
+        for(const plane of clipPlanes){
+          poly = clipPolygonAgainstPlane(poly, plane, planeSegments[plane.name]);
+          if(poly.length < 3) break;
+        }
+      }
+      if(poly.length < 3){ clippedTriangles++; continue; }
+      for(let i=1;i<poly.length-1;i++){
+        out.push(...poly[0].p, ...poly[i].p, ...poly[i+1].p); triCount++;
+        if(triCount>BUILDING_MAX_TRIANGLES){ tiles.dispose?.(); throw new Error(`Zu viele Gebäudedreiecke (> ${BUILDING_MAX_TRIANGLES.toLocaleString('de-CH')}). Bitte einen kleineren Ausschnitt wählen oder Gebäude deaktivieren.`); }
+      }
+    }
+    for(const plane of clipPlanes){
+      const addedCaps = appendCapTrianglesForPlane(out, planeSegments[plane.name], plane);
+      meshCap += addedCaps;
+      capTriangles += addedCaps;
+      triCount += addedCaps;
+      if(triCount > BUILDING_MAX_TRIANGLES){ tiles.dispose?.(); throw new Error(`Zu viele Gebäudedreiecke (> ${BUILDING_MAX_TRIANGLES.toLocaleString('de-CH')}). Bitte einen kleineren Ausschnitt wählen oder Gebäude deaktivieren.`); }
     }
   }
   debug(`Gebäude-Fundamentband: ${foundationBandMm.toFixed(2)} mm über lokalem Terrain.`);
   tiles.dispose?.();
   if (!triCount) throw new Error('Keine Gebäudedreiecke innerhalb des Reliefausschnitts gefunden.');
-  debug(`Gebäude: ${triCount.toLocaleString('de-CH')} Dreiecke übernommen; ${borderBuildingsRemoved.toLocaleString('de-CH')} Rand-Gebäudekörper vollständig entfernt (${clipped.toLocaleString('de-CH')} Dreiecke); ${foundationVertices.toLocaleString('de-CH')} Fassaden-Bodenpunkte ins Terrain verlängert.`);
+  debug(`Gebäude: ${triCount.toLocaleString('de-CH')} Dreiecke übernommen; ${borderBuildingsClipped.toLocaleString('de-CH')} Rand-Gebäudekörper sauber am Reliefrahmen gekappt; ${capTriangles.toLocaleString('de-CH')} Abschluss-Dreiecke für Schnittflächen; ${clippedTriangles.toLocaleString('de-CH')} Dreiecke beim Kappen beschnitten/verworfen; ${foundationVertices.toLocaleString('de-CH')} Fassaden-Bodenpunkte ins Terrain verlängert.`);
   return { triangles:new Float32Array(out), meta:{ triangleCount:triCount, meshCount:meshes.length, heightFactor, geoidOffset } };
 }
 
