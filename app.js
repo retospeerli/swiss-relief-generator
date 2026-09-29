@@ -6,7 +6,7 @@ import { DRACOLoader } from 'https://cdn.jsdelivr.net/npm/three@0.180.0/examples
 const STAC_COLLECTION = 'ch.swisstopo.swissalti3d';
 const STAC_ITEMS = `https://data.geo.admin.ch/api/stac/v1/collections/${STAC_COLLECTION}/items`;
 const REGIO_COLLECTION = 'ch.swisstopo.swissaltiregio';
-const APP_VERSION = '0.6.14';
+const APP_VERSION = '0.6.15';
 const REGIO_ITEMS = `https://data.geo.admin.ch/api/stac/v1/collections/${REGIO_COLLECTION}/items`;
 const MAX_TILES = 1600;
 const MAX_STAC_PAGES = 120;
@@ -1272,16 +1272,26 @@ async function loadBuildingTriangles(t) {
       const [ia,ib,ic]=triangleIndices(idx,ti);
       unite(ia,ib); unite(ib,ic);
     }
-    // Falls ein glTF nicht-indexiert geliefert wird, gleiche geometrisch identische
-    // Eckpunkte verschweissen, damit ein Haus nicht in einzelne Dreiecke zerfällt.
-    if(!idx){
-      const weld=new Map();
-      for(let vi=0;vi<verts.length;vi++){
-        const v=verts[vi];
-        const k=`${Math.round(v.p[0]*10000)}:${Math.round(v.p[1]*10000)}:${Math.round(v.p[2]*10000)}`;
-        if(weld.has(k)) unite(vi,weld.get(k)); else weld.set(k,vi);
-      }
+    // WICHTIG: swissBUILDINGS³D / glTF dupliziert Vertices oft an harten
+    // Kanten (Fassade ↔ Dach, Giebel ↔ Dach), AUCH bei indexierten Meshes.
+    // Topologisch sind diese Flächen dann über Indizes nicht verbunden, obwohl
+    // sie geometrisch exakt dieselben Eckpunkte besitzen. Für das saubere
+    // Schneiden eines Randhauses müssen wir deshalb IMMER geometrisch
+    // identische Punkte verschweissen, nicht nur bei nicht-indexierten Meshes.
+    // 1e-4 mm im fertigen Modell ist deutlich kleiner als jede Druckrelevanz,
+    // aber gross genug, um numerisches Transformationsrauschen aufzufangen.
+    const weld=new Map();
+    let weldedVertices=0;
+    const WELD_SCALE=10000; // 0.0001 mm
+    for(let vi=0;vi<verts.length;vi++){
+      const v=verts[vi];
+      const k=`${Math.round(v.p[0]*WELD_SCALE)}:${Math.round(v.p[1]*WELD_SCALE)}:${Math.round(v.p[2]*WELD_SCALE)}`;
+      if(weld.has(k)){
+        const other=weld.get(k);
+        if(find(vi)!==find(other)){ unite(vi,other); weldedVertices++; }
+      } else weld.set(k,vi);
     }
+    if(weldedVertices) debug(`Gebäude-Topologie: ${weldedVertices.toLocaleString('de-CH')} geometrisch identische Vertex-Verbindungen verschweisst.`);
 
     const compTris=new Map(), compVerts=new Map(), compTerr=new Map();
     for(let ti=0;ti<ntri;ti++){
@@ -1377,6 +1387,12 @@ async function loadBuildingTriangles(t) {
           if(x<bx0-1e-4||x>bx1+1e-4||y<by0-1e-4||y>by1+1e-4){valid=false;break;}
         }
       }
+
+      // Ein tatsächlich geschnittenes Randhaus MUSS mindestens eine geschlossene
+      // Schnittfläche erzeugen. Ohne Cap wäre es kein druckbarer geschlossener
+      // Körper; in diesem Fall lieber den ausdrücklich gewünschten Vollhaus-
+      // Fallback statt eines offenen STL-Fragments.
+      if(localCaps===0) valid=false;
 
       if(valid && temp.length){
         out.push(...temp);
