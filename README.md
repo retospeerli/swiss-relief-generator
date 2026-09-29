@@ -1,4 +1,10 @@
+Swiss Relief STL Generator v0.6.17
+
+Daten: swissALTI³D · swissALTIRegio · swissBUILDINGS³D · Quelle: swisstopo
+
 # Swiss Relief STL Generator
+
+**Autor:** Reto Speerli
 
 ## v0.6 – Abdeckung und Kachelgrenzen
 
@@ -67,3 +73,17 @@ Wenn swissALTI3D am Landesrand keine Daten mehr liefert, ergänzt die App fehlen
 - Bei ungeeignetem Massstab oder zu grosser Fläche deaktiviert die App die Checkbox automatisch und nennt den Grund.
 
 Die Gebäudefunktion ist für Orts-, Quartier- und kleinere Landschaftsmodelle gedacht. Für Kantons- oder Grossregionsmodelle bleibt sie bewusst deaktiviert.
+
+
+## v0.6.9
+Gebäude an Hanglagen werden nicht mehr punktweise an das Gelände verformt. Die Gebäudehöhe bleibt geometrisch stabil; untere Fassadenkanten werden lokal bis leicht unter die Terrainoberfläche verlängert, damit keine schwebenden Häuser/Sockel entstehen.
+
+
+## v0.6.17
+- Gebäude werden nicht mehr mit der Gelände-Höhenüberhöhung gestreckt.
+- Jeder zusammenhängende Gebäudekörper bleibt geometrisch starr und erhält nur einen konstanten Z-Versatz passend zur lokalen Terrain-Überhöhung.
+- Fundamente werden weiterhin nur nach unten ins Gelände verlängert.
+
+
+## v0.6.17
+Randgebäude werden nicht mehr dreiecksweise abgeschnitten. Jeder zusammenhängende Gebäudekörper, der den Reliefrahmen überschreitet, wird vollständig ausgelassen. Dadurch entstehen am Modellrand keine offenen Gebäude-Meshes.
