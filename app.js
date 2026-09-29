@@ -6,7 +6,7 @@ import { DRACOLoader } from 'https://cdn.jsdelivr.net/npm/three@0.180.0/examples
 const STAC_COLLECTION = 'ch.swisstopo.swissalti3d';
 const STAC_ITEMS = `https://data.geo.admin.ch/api/stac/v1/collections/${STAC_COLLECTION}/items`;
 const REGIO_COLLECTION = 'ch.swisstopo.swissaltiregio';
-const APP_VERSION = '0.6.12';
+const APP_VERSION = '0.6.14';
 const REGIO_ITEMS = `https://data.geo.admin.ch/api/stac/v1/collections/${REGIO_COLLECTION}/items`;
 const MAX_TILES = 1600;
 const MAX_STAC_PAGES = 120;
@@ -22,6 +22,9 @@ const BUILDING_MIN_TYPICAL_HEIGHT_MM = 0.8;
 const BUILDING_TYPICAL_HEIGHT_M = 10;
 const BUILDING_MAX_TRIANGLES = 1500000;
 
+const APP_DATASETS = 'swissALTI³D · swissALTIRegio · swissBUILDINGS³D';
+const APP_SOURCE = 'swisstopo';
+
 const $ = (id) => document.getElementById(id);
 const els = {
   generateBtn: $('generateBtn'), downloadBtn: $('downloadBtn'), clearBtn: $('clearBtn'), resetViewBtn: $('resetViewBtn'),
@@ -30,6 +33,10 @@ const els = {
   selectionInfo: $('selectionInfo'), metrics: $('metrics'), statusText: $('statusText'), statusPct: $('statusPct'),
   progress: $('progress'), preview: $('preview'), resultInfo: $('resultInfo'), debug: $('debug')
 };
+
+const versionEl = $('appVersion');
+if (versionEl) versionEl.textContent = `v${APP_VERSION}`;
+document.title = `Swiss Relief STL Generator v${APP_VERSION} · ${APP_DATASETS} · Quelle: ${APP_SOURCE}`;
 
 let selectedBounds = null;
 let selectedLayer = null;
@@ -971,6 +978,132 @@ function appendCapTrianglesForPlane(out, segments, plane) {
   return count;
 }
 
+
+function makeModelClipPlanes(t) {
+  return [
+    { name:'xmin', axis:0, coord:-t.dims.widthMm/2, keep:'ge', outward:'negx' },
+    { name:'xmax', axis:0, coord: t.dims.widthMm/2, keep:'le', outward:'posx' },
+    { name:'ymin', axis:1, coord:-t.dims.depthMm/2, keep:'ge', outward:'negy' },
+    { name:'ymax', axis:1, coord: t.dims.depthMm/2, keep:'le', outward:'posy' }
+  ];
+}
+
+function cloneModelClipVertex(v) {
+  return { p:[v.p[0], v.p[1], v.p[2]] };
+}
+
+function lerpModelClipVertex(a, b, t) {
+  return { p:[
+    a.p[0] + (b.p[0]-a.p[0])*t,
+    a.p[1] + (b.p[1]-a.p[1])*t,
+    a.p[2] + (b.p[2]-a.p[2])*t
+  ] };
+}
+
+function modelInsidePlane(v, plane, eps=1e-8) {
+  const q=v.p[plane.axis];
+  return plane.keep==='ge' ? q >= plane.coord-eps : q <= plane.coord+eps;
+}
+
+function clipModelPolygonAgainstPlane(poly, plane, segmentsOut) {
+  if(!poly.length) return poly;
+  const out=[], intersections=[];
+  let prev=poly[poly.length-1], prevIn=modelInsidePlane(prev,plane);
+  for(const curr of poly){
+    const currIn=modelInsidePlane(curr,plane);
+    if(currIn!==prevIn){
+      const denom=curr.p[plane.axis]-prev.p[plane.axis];
+      const tt=Math.abs(denom)<1e-14 ? 0 : (plane.coord-prev.p[plane.axis])/denom;
+      const inter=lerpModelClipVertex(prev,curr,Math.max(0,Math.min(1,tt)));
+      inter.p[plane.axis]=plane.coord;
+      intersections.push(inter);
+      out.push(inter);
+    }
+    if(currIn) out.push(curr);
+    prev=curr; prevIn=currIn;
+  }
+  if(intersections.length===2) segmentsOut.push([intersections[0],intersections[1]]);
+  return out;
+}
+
+function modelPointKey2D(v, plane, scale=100000) {
+  const u=plane.axis===0 ? v.p[1] : v.p[0];
+  return `${Math.round(u*scale)}:${Math.round(v.p[2]*scale)}`;
+}
+
+function normalizeCutSegments(segments, plane) {
+  const unique=new Map();
+  for(const seg of segments){
+    const a=modelPointKey2D(seg[0],plane), b=modelPointKey2D(seg[1],plane);
+    if(a===b) continue;
+    const key=a<b ? `${a}|${b}` : `${b}|${a}`;
+    if(!unique.has(key)) unique.set(key,seg);
+  }
+  return [...unique.values()];
+}
+
+function buildValidatedCutLoops(segments, plane) {
+  const clean=normalizeCutSegments(segments,plane);
+  if(!clean.length) return {ok:true,loops:[],segments:clean};
+  const nodes=new Map(), edges=[];
+  const add=(v)=>{
+    const k=modelPointKey2D(v,plane);
+    if(!nodes.has(k)) nodes.set(k,{pt:v,edges:[]});
+    return k;
+  };
+  for(const seg of clean){
+    const a=add(seg[0]), b=add(seg[1]);
+    if(a===b) continue;
+    const ei=edges.length;
+    edges.push({a,b,used:false});
+    nodes.get(a).edges.push(ei); nodes.get(b).edges.push(ei);
+  }
+  // A watertight manifold cross-section must be a union of closed 2-regular loops.
+  for(const n of nodes.values()) if(n.edges.length!==2) return {ok:false,loops:[],segments:clean};
+  const loops=[];
+  for(let i=0;i<edges.length;i++){
+    if(edges[i].used) continue;
+    const e0=edges[i]; e0.used=true;
+    const start=e0.a; let prev=e0.a, curr=e0.b;
+    const loop=[nodes.get(start).pt,nodes.get(curr).pt];
+    let guard=0;
+    while(curr!==start && guard++<100000){
+      const opts=nodes.get(curr).edges.filter(ei=>!edges[ei].used);
+      if(opts.length!==1) return {ok:false,loops:[],segments:clean};
+      const e=edges[opts[0]]; e.used=true;
+      const next=e.a===curr?e.b:e.a;
+      if(next!==start) loop.push(nodes.get(next).pt);
+      prev=curr; curr=next;
+    }
+    if(curr!==start || loop.length<3) return {ok:false,loops:[],segments:clean};
+    loops.push(loop);
+  }
+  return {ok:true,loops,segments:clean};
+}
+
+function appendValidatedCaps(out, loopSets, plane) {
+  let count=0;
+  for(const loop of loopSets){
+    const contour=loop.map(v=>plane.axis===0 ? new THREE.Vector2(v.p[1],v.p[2]) : new THREE.Vector2(v.p[0],v.p[2]));
+    const tris=THREE.ShapeUtils.triangulateShape(contour,[]);
+    if(!tris.length && loop.length>2) return {ok:false,count};
+    for(const tr of tris){
+      const A=loop[tr[0]].p.slice(), B=loop[tr[1]].p.slice(), C=loop[tr[2]].p.slice();
+      const ux=B[0]-A[0],uy=B[1]-A[1],uz=B[2]-A[2];
+      const vx=C[0]-A[0],vy=C[1]-A[1],vz=C[2]-A[2];
+      const nx=uy*vz-uz*vy, ny=uz*vx-ux*vz;
+      const sign=plane.outward==='negx'?-nx:plane.outward==='posx'?nx:plane.outward==='negy'?-ny:ny;
+      if(sign<0) out.push(...A,...C,...B); else out.push(...A,...B,...C);
+      count++;
+    }
+  }
+  return {ok:true,count};
+}
+
+function triangleIndices(idx, ti){
+  return idx ? [idx.getX(ti*3),idx.getX(ti*3+1),idx.getX(ti*3+2)] : [ti*3,ti*3+1,ti*3+2];
+}
+
 async function loadBuildingTriangles(t) {
   const elig = buildingEligibility(t.dims);
   if (!els.includeBuildings.checked || !elig.ok) return { triangles:null, meta:null };
@@ -1090,9 +1223,9 @@ async function loadBuildingTriangles(t) {
   debug(`Gebäude-Höhenabgleich: lokaler Offset ≈ ${geoidOffset.toFixed(2)} m · Gebäudehöhe 1.00× (keine Relief-Überhöhung).`);
 
   const out=[];
-  let triCount=0, clippedTriangles=0, capTriangles=0, foundationVertices=0, borderBuildingsClipped=0;
+  let triCount=0, clippedTriangles=0, capTriangles=0, foundationVertices=0, borderBuildingsClipped=0, borderFallbackFull=0;
   const va=new THREE.Vector3(), vb=new THREE.Vector3(), vc=new THREE.Vector3();
-  const clipPlanes = makeBuildingClipPlanes(t);
+  const modelClipPlanes = makeModelClipPlanes(t);
   const baseMm=Number(els.baseThickness.value);
   const zExag=Number(els.zExaggeration.value);
   const embedMm=0.18;
@@ -1128,128 +1261,142 @@ async function loadBuildingTriangles(t) {
       verts[vi]=toModelBase(va);
     }
 
-    // Zusammenhängende Gebäudekörper bestimmen. swissBUILDINGS³D kann mehrere
-    // Gebäude in einem Tile-Mesh enthalten. Jeder Körper bekommt EINEN
-    // konstanten Höhenversatz für die Terrain-Überhöhung; dadurch wird kein
-    // Haus in der Höhe gestreckt und kein Dach an einem Hang verbogen.
+    // Zusammenhängende Gebäudekörper bestimmen. Die Randbearbeitung muss pro
+    // Gebäude erfolgen, nicht pro Tile-Mesh: ein swisstopo-Tile enthält viele Häuser.
     const parent=new Int32Array(pos.count);
     for(let i=0;i<parent.length;i++) parent[i]=i;
     const find=(a)=>{ while(parent[a]!==a){ parent[a]=parent[parent[a]]; a=parent[a]; } return a; };
     const unite=(a,b)=>{ a=find(a); b=find(b); if(a!==b) parent[b]=a; };
     const ntri=idx ? Math.floor(idx.count/3) : Math.floor(pos.count/3);
     for(let ti=0;ti<ntri;ti++){
-      const ia=idx?idx.getX(ti*3):ti*3, ib=idx?idx.getX(ti*3+1):ti*3+1, ic=idx?idx.getX(ti*3+2):ti*3+2;
+      const [ia,ib,ic]=triangleIndices(idx,ti);
       unite(ia,ib); unite(ib,ic);
     }
-    const compTerr=new Map();
-    const compBounds=new Map();
-    for(let vi=0;vi<verts.length;vi++){
-      const r=find(vi);
-      let arr=compTerr.get(r); if(!arr){arr=[]; compTerr.set(r,arr);}
-      arr.push(verts[vi].terr);
-      let b=compBounds.get(r);
-      if(!b){ b={minX:Infinity,maxX:-Infinity,minY:Infinity,maxY:-Infinity}; compBounds.set(r,b); }
-      const v=verts[vi];
-      if(v.x<b.minX) b.minX=v.x; if(v.x>b.maxX) b.maxX=v.x;
-      if(v.y<b.minY) b.minY=v.y; if(v.y>b.maxY) b.maxY=v.y;
-    }
-    const borderMarginM=Math.max(0.01/t.dims.mmPerMeter, 0.02); // numerical tolerance only
-    const compMode=new Map();
-    for(const [r,b] of compBounds){
-      const disjoint = b.maxX < t.dims.minX - borderMarginM || b.minX > t.dims.maxX + borderMarginM ||
-                       b.maxY < t.dims.minY - borderMarginM || b.minY > t.dims.maxY + borderMarginM;
-      if(disjoint){ compMode.set(r,'skip'); continue; }
-      const inside = b.minX >= t.dims.minX + borderMarginM &&
-                     b.maxX <= t.dims.maxX - borderMarginM &&
-                     b.minY >= t.dims.minY + borderMarginM &&
-                     b.maxY <= t.dims.maxY - borderMarginM;
-      compMode.set(r, inside ? 'inside' : 'clip');
-      if(!inside) borderBuildingsClipped++;
-    }
-    const compRef=new Map();
-    for(const [r,arr] of compTerr){
-      if(compMode.get(r)==='skip') continue;
-      arr.sort((a,b)=>a-b);
-      const qi=Math.min(arr.length-1, Math.max(0, Math.floor(arr.length*0.15)));
-      compRef.set(r,arr[qi]);
-    }
-    for(let vi=0;vi<verts.length;vi++){
-      const r=find(vi);
-      if(compMode.get(r)==='skip') continue;
-      const refTerr=compRef.get(r);
-      const exaggerationShift=(refTerr-t.stats.min)*t.dims.mmPerMeter*(zExag-1);
-      verts[vi].p[2]+=exaggerationShift;
-    }
-
-    // First pass: identify ONLY genuine foundation vertices on near-vertical
-    // facade triangles. The old triangle-local minimum test also selected the
-    // two eave corners of triangular gable faces and pulled them downward,
-    // opening a gap between wall and roof.
-    const foundationIdx=new Set();
-    for(let ti=0;ti<ntri;ti++){
-      const ia=idx?idx.getX(ti*3):ti*3, ib=idx?idx.getX(ti*3+1):ti*3+1, ic=idx?idx.getX(ti*3+2):ti*3+2;
-      const r=find(ia);
-      if(compMode.get(r)==='skip') continue;
-      const A=verts[ia],B=verts[ib],C=verts[ic];
-      const ax=B.p[0]-A.p[0], ay=B.p[1]-A.p[1], az=B.p[2]-A.p[2];
-      const bx=C.p[0]-A.p[0], by=C.p[1]-A.p[1], bz=C.p[2]-A.p[2];
-      const nx=ay*bz-az*by, ny=az*bx-ax*bz, nz=ax*by-ay*bx;
-      const nlen=Math.hypot(nx,ny,nz) || 1;
-      const verticality=Math.abs(nz)/nlen;
-      if(verticality>0.45) continue;
-      for(const vi of [ia,ib,ic]){
+    // Falls ein glTF nicht-indexiert geliefert wird, gleiche geometrisch identische
+    // Eckpunkte verschweissen, damit ein Haus nicht in einzelne Dreiecke zerfällt.
+    if(!idx){
+      const weld=new Map();
+      for(let vi=0;vi<verts.length;vi++){
         const v=verts[vi];
-        const aboveTerrain=v.p[2]-v.terrainZ;
-        if(aboveTerrain>=-0.25 && aboveTerrain<=foundationBandMm){
-          foundationIdx.add(vi);
-        }
+        const k=`${Math.round(v.p[0]*10000)}:${Math.round(v.p[1]*10000)}:${Math.round(v.p[2]*10000)}`;
+        if(weld.has(k)) unite(vi,weld.get(k)); else weld.set(k,vi);
       }
     }
 
-    // Apply the correction once per shared vertex. Roof, eave and gable-top
-    // vertices are outside the foundation band and therefore remain untouched.
-    for(const vi of foundationIdx){
-      const v=verts[vi];
-      const target=v.terrainZ-embedMm;
-      if(v.p[2]>target){ v.p[2]=target; foundationVertices++; }
-    }
-
-    // Second pass: keep all interior buildings as-is. Buildings crossing the
-    // relief frame are clipped against the rectangular model boundary and the
-    // cut sections are closed with watertight vertical cap faces, so all
-    // border buildings remain printable/manifold.
-    const planeSegments = { xmin:[], xmax:[], ymin:[], ymax:[] };
-    let meshCap = 0;
+    const compTris=new Map(), compVerts=new Map(), compTerr=new Map();
     for(let ti=0;ti<ntri;ti++){
-      const ia=idx?idx.getX(ti*3):ti*3, ib=idx?idx.getX(ti*3+1):ti*3+1, ic=idx?idx.getX(ti*3+2):ti*3+2;
-      const r=find(ia);
-      const mode=compMode.get(r);
-      if(mode==='skip') continue;
-      let poly=[cloneClipVertex(verts[ia]), cloneClipVertex(verts[ib]), cloneClipVertex(verts[ic])];
-      if(mode==='clip'){
-        for(const plane of clipPlanes){
-          poly = clipPolygonAgainstPlane(poly, plane, planeSegments[plane.name]);
-          if(poly.length < 3) break;
+      const inds=triangleIndices(idx,ti); const r=find(inds[0]);
+      if(!compTris.has(r)) compTris.set(r,[]);
+      compTris.get(r).push(inds);
+    }
+    for(let vi=0;vi<verts.length;vi++){
+      const r=find(vi);
+      if(!compVerts.has(r)) compVerts.set(r,[]);
+      compVerts.get(r).push(vi);
+      if(!compTerr.has(r)) compTerr.set(r,[]);
+      compTerr.get(r).push(verts[vi].terr);
+    }
+
+    for(const [r,tris] of compTris){
+      const vis=compVerts.get(r)||[];
+      if(!vis.length) continue;
+      const arr=(compTerr.get(r)||[]).slice().sort((a,b)=>a-b);
+      const qi=Math.min(arr.length-1,Math.max(0,Math.floor(arr.length*0.15)));
+      const refTerr=arr[qi];
+      const exaggerationShift=(refTerr-t.stats.min)*t.dims.mmPerMeter*(zExag-1);
+      for(const vi of vis) verts[vi].p[2]+=exaggerationShift;
+
+      // Nur echte Sockelpunkte dieses Gebäudes bis leicht ins Terrain ziehen.
+      const foundationIdx=new Set();
+      for(const [ia,ib,ic] of tris){
+        const A=verts[ia],B=verts[ib],C=verts[ic];
+        const ax=B.p[0]-A.p[0], ay=B.p[1]-A.p[1], az=B.p[2]-A.p[2];
+        const bx=C.p[0]-A.p[0], by=C.p[1]-A.p[1], bz=C.p[2]-A.p[2];
+        const nx=ay*bz-az*by, ny=az*bx-ax*bz, nz=ax*by-ay*bx;
+        const nlen=Math.hypot(nx,ny,nz)||1;
+        if(Math.abs(nz)/nlen>0.45) continue;
+        for(const vi of [ia,ib,ic]){
+          const v=verts[vi], above=v.p[2]-v.terrainZ;
+          if(above>=-0.25 && above<=foundationBandMm) foundationIdx.add(vi);
         }
       }
-      if(poly.length < 3){ clippedTriangles++; continue; }
-      for(let i=1;i<poly.length-1;i++){
-        out.push(...poly[0].p, ...poly[i].p, ...poly[i+1].p); triCount++;
-        if(triCount>BUILDING_MAX_TRIANGLES){ tiles.dispose?.(); throw new Error(`Zu viele Gebäudedreiecke (> ${BUILDING_MAX_TRIANGLES.toLocaleString('de-CH')}). Bitte einen kleineren Ausschnitt wählen oder Gebäude deaktivieren.`); }
+      for(const vi of foundationIdx){
+        const v=verts[vi], target=v.terrainZ-embedMm;
+        if(v.p[2]>target){v.p[2]=target;foundationVertices++;}
       }
-    }
-    for(const plane of clipPlanes){
-      const addedCaps = appendCapTrianglesForPlane(out, planeSegments[plane.name], plane);
-      meshCap += addedCaps;
-      capTriangles += addedCaps;
-      triCount += addedCaps;
-      if(triCount > BUILDING_MAX_TRIANGLES){ tiles.dispose?.(); throw new Error(`Zu viele Gebäudedreiecke (> ${BUILDING_MAX_TRIANGLES.toLocaleString('de-CH')}). Bitte einen kleineren Ausschnitt wählen oder Gebäude deaktivieren.`); }
+
+      // Klassifikation ausschliesslich in den fertigen Modellkoordinaten (mm).
+      let minX=Infinity,maxX=-Infinity,minY=Infinity,maxY=-Infinity;
+      for(const vi of vis){
+        const p=verts[vi].p;
+        minX=Math.min(minX,p[0]);maxX=Math.max(maxX,p[0]);
+        minY=Math.min(minY,p[1]);maxY=Math.max(maxY,p[1]);
+      }
+      const bx0=-t.dims.widthMm/2, bx1=t.dims.widthMm/2, by0=-t.dims.depthMm/2, by1=t.dims.depthMm/2;
+      const eps=1e-5;
+      const disjoint=maxX<bx0-eps || minX>bx1+eps || maxY<by0-eps || minY>by1+eps;
+      if(disjoint) continue;
+      const inside=minX>=bx0-eps && maxX<=bx1+eps && minY>=by0-eps && maxY<=by1+eps;
+
+      if(inside){
+        for(const [ia,ib,ic] of tris){ out.push(...verts[ia].p,...verts[ib].p,...verts[ic].p); triCount++; }
+        continue;
+      }
+
+      borderBuildingsClipped++;
+      const temp=[];
+      const segs={xmin:[],xmax:[],ymin:[],ymax:[]};
+      let localClipped=0;
+      for(const [ia,ib,ic] of tris){
+        let poly=[cloneModelClipVertex(verts[ia]),cloneModelClipVertex(verts[ib]),cloneModelClipVertex(verts[ic])];
+        for(const plane of modelClipPlanes){
+          poly=clipModelPolygonAgainstPlane(poly,plane,segs[plane.name]);
+          if(poly.length<3) break;
+        }
+        if(poly.length<3){localClipped++;continue;}
+        for(let i=1;i<poly.length-1;i++) temp.push(...poly[0].p,...poly[i].p,...poly[i+1].p);
+      }
+
+      // Schnittkonturen pro Haus und pro Reliefseite validieren. Nur geschlossene,
+      // zweifach verbundene Konturen werden trianguliert. Das verhindert offene
+      // Fassaden oder eine Rückwand, die zu einem benachbarten Haus gehört.
+      let valid=true, localCaps=0;
+      for(const plane of modelClipPlanes){
+        const info=buildValidatedCutLoops(segs[plane.name],plane);
+        if(!info.ok){ valid=false; break; }
+        const cap=appendValidatedCaps(temp,info.loops,plane);
+        if(!cap.ok){ valid=false; break; }
+        localCaps+=cap.count;
+      }
+
+      // Zusätzliche harte Kontrolle: Nach einem gültigen Schnitt darf kein Punkt
+      // mehr ausserhalb des Reliefrahmens liegen.
+      if(valid){
+        for(let i=0;i<temp.length;i+=3){
+          const x=temp[i], y=temp[i+1];
+          if(x<bx0-1e-4||x>bx1+1e-4||y<by0-1e-4||y>by1+1e-4){valid=false;break;}
+        }
+      }
+
+      if(valid && temp.length){
+        out.push(...temp);
+        const added=Math.floor(temp.length/9);
+        triCount+=added;
+        capTriangles+=localCaps;
+        clippedTriangles+=localClipped;
+      } else {
+        // Gewünschter Fallback: dieses eine Randhaus vollständig belassen. Das ist
+        // leichter manuell abzuschneiden als ein offener, nicht reparierbarer Körper.
+        borderFallbackFull++;
+        for(const [ia,ib,ic] of tris){ out.push(...verts[ia].p,...verts[ib].p,...verts[ic].p); triCount++; }
+      }
+      if(triCount>BUILDING_MAX_TRIANGLES){ tiles.dispose?.(); throw new Error(`Zu viele Gebäudedreiecke (> ${BUILDING_MAX_TRIANGLES.toLocaleString('de-CH')}). Bitte einen kleineren Ausschnitt wählen oder Gebäude deaktivieren.`); }
     }
   }
   debug(`Gebäude-Fundamentband: ${foundationBandMm.toFixed(2)} mm über lokalem Terrain.`);
   tiles.dispose?.();
   if (!triCount) throw new Error('Keine Gebäudedreiecke innerhalb des Reliefausschnitts gefunden.');
-  debug(`Gebäude: ${triCount.toLocaleString('de-CH')} Dreiecke übernommen; ${borderBuildingsClipped.toLocaleString('de-CH')} Rand-Gebäudekörper sauber am Reliefrahmen gekappt; ${capTriangles.toLocaleString('de-CH')} Abschluss-Dreiecke für Schnittflächen; ${clippedTriangles.toLocaleString('de-CH')} Dreiecke beim Kappen beschnitten/verworfen; ${foundationVertices.toLocaleString('de-CH')} Fassaden-Bodenpunkte ins Terrain verlängert.`);
+  debug(`Gebäude: ${triCount.toLocaleString('de-CH')} Dreiecke übernommen; ${borderBuildingsClipped.toLocaleString('de-CH')} Randhäuser einzeln bearbeitet; ${capTriangles.toLocaleString('de-CH')} Abschluss-Dreiecke für geschlossene Schnittflächen; ${clippedTriangles.toLocaleString('de-CH')} ausserhalb liegende Dreiecke verworfen; Fallback vollständig: ${borderFallbackFull.toLocaleString('de-CH')} Haus/Häuser; ${foundationVertices.toLocaleString('de-CH')} Fassaden-Bodenpunkte ins Terrain verlängert.`);
   return { triangles:new Float32Array(out), meta:{ triangleCount:triCount, meshCount:meshes.length, heightFactor, geoidOffset } };
 }
 
