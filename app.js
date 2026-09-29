@@ -6,7 +6,7 @@ import { DRACOLoader } from 'https://cdn.jsdelivr.net/npm/three@0.180.0/examples
 const STAC_COLLECTION = 'ch.swisstopo.swissalti3d';
 const STAC_ITEMS = `https://data.geo.admin.ch/api/stac/v1/collections/${STAC_COLLECTION}/items`;
 const REGIO_COLLECTION = 'ch.swisstopo.swissaltiregio';
-const APP_VERSION = '0.6.15';
+const APP_VERSION = '0.6.16';
 const REGIO_ITEMS = `https://data.geo.admin.ch/api/stac/v1/collections/${REGIO_COLLECTION}/items`;
 const MAX_TILES = 1600;
 const MAX_STAC_PAGES = 120;
@@ -46,6 +46,8 @@ let renderer, scene, camera, controls, terrainGroup;
 let lastBuildingTriangles = null;
 let lastBuildingMeta = null;
 let TilesRendererClass = null;
+let CsgModulePromise = null;
+let BufferUtilsPromise = null;
 
 async function getTilesRendererClass() {
   if (TilesRendererClass) return TilesRendererClass;
@@ -1104,6 +1106,97 @@ function triangleIndices(idx, ti){
   return idx ? [idx.getX(ti*3),idx.getX(ti*3+1),idx.getX(ti*3+2)] : [ti*3,ti*3+1,ti*3+2];
 }
 
+
+async function getCsgModule() {
+  if (!CsgModulePromise) {
+    CsgModulePromise = import('https://esm.sh/three-bvh-csg@0.0.18?external=three');
+  }
+  return CsgModulePromise;
+}
+
+async function getBufferUtils() {
+  if (!BufferUtilsPromise) {
+    BufferUtilsPromise = import('three/addons/utils/BufferGeometryUtils.js');
+  }
+  return BufferUtilsPromise;
+}
+
+function geometryTrianglesToArray(geometry) {
+  const out = [];
+  const pos = geometry.getAttribute('position');
+  const idx = geometry.index;
+  if (!pos) return out;
+  const start = Math.max(0, geometry.drawRange?.start || 0);
+  const rawCount = Number.isFinite(geometry.drawRange?.count) ? geometry.drawRange.count : (idx ? idx.count : pos.count);
+  const end = Math.min(idx ? idx.count : pos.count, start + rawCount);
+  const readVertex = (i) => [pos.getX(i), pos.getY(i), pos.getZ(i)];
+  for (let i = start; i + 2 < end; i += 3) {
+    const ia = idx ? idx.getX(i) : i;
+    const ib = idx ? idx.getX(i + 1) : i + 1;
+    const ic = idx ? idx.getX(i + 2) : i + 2;
+    out.push(...readVertex(ia), ...readVertex(ib), ...readVertex(ic));
+  }
+  return out;
+}
+
+async function hardCropBuildingSolid(fullTriangles, t) {
+  // Second-stage boolean crop. This is intentionally used only for border
+  // buildings where the lightweight polygon clip could not produce a validated
+  // closed cap. The input remains the complete watertight building body.
+  const { Brush, Evaluator, INTERSECTION } = await getCsgModule();
+  const { mergeVertices } = await getBufferUtils();
+
+  let geom = new THREE.BufferGeometry();
+  geom.setAttribute('position', new THREE.Float32BufferAttribute(fullTriangles, 3));
+  geom = mergeVertices(geom, 1e-5);
+  geom.computeVertexNormals();
+  geom.deleteAttribute('uv');
+  geom.deleteAttribute('uv1');
+  geom.deleteAttribute('color');
+
+  geom.computeBoundingBox();
+  const bb = geom.boundingBox;
+  if (!bb || !Number.isFinite(bb.min.z) || !Number.isFinite(bb.max.z)) throw new Error('ungültige Gebäude-Boundingbox');
+
+  const padZ = Math.max(10, (bb.max.z - bb.min.z) * 0.25 + 2);
+  const boxHeight = (bb.max.z - bb.min.z) + 2 * padZ;
+  const boxCenterZ = (bb.max.z + bb.min.z) / 2;
+
+  const boxGeom = new THREE.BoxGeometry(t.dims.widthMm, t.dims.depthMm, boxHeight);
+  boxGeom.deleteAttribute('uv');
+  boxGeom.computeVertexNormals();
+
+  const a = new Brush(geom);
+  a.updateMatrixWorld(true);
+  const b = new Brush(boxGeom);
+  b.position.set(0, 0, boxCenterZ);
+  b.updateMatrixWorld(true);
+
+  const evaluator = new Evaluator();
+  evaluator.useGroups = false;
+  evaluator.consolidateGroups = true;
+  const result = evaluator.evaluate(a, b, INTERSECTION);
+  result.updateMatrixWorld(true);
+  let resultGeom = result.geometry;
+  if (!resultGeom?.getAttribute('position')) throw new Error('CSG lieferte keine Geometrie');
+
+  // Bake result matrix in case the implementation returns a transformed brush.
+  resultGeom = resultGeom.clone();
+  resultGeom.applyMatrix4(result.matrixWorld);
+  const arr = geometryTrianglesToArray(resultGeom);
+  if (!arr.length) throw new Error('CSG-Schnitt ist leer');
+
+  const bx0 = -t.dims.widthMm / 2, bx1 = t.dims.widthMm / 2;
+  const by0 = -t.dims.depthMm / 2, by1 = t.dims.depthMm / 2;
+  for (let i = 0; i < arr.length; i += 3) {
+    const x = arr[i], y = arr[i + 1];
+    if (x < bx0 - 1e-3 || x > bx1 + 1e-3 || y < by0 - 1e-3 || y > by1 + 1e-3) {
+      throw new Error('CSG-Ergebnis ragt noch über den Reliefrahmen');
+    }
+  }
+  return arr;
+}
+
 async function loadBuildingTriangles(t) {
   const elig = buildingEligibility(t.dims);
   if (!els.includeBuildings.checked || !elig.ok) return { triangles:null, meta:null };
@@ -1223,7 +1316,7 @@ async function loadBuildingTriangles(t) {
   debug(`Gebäude-Höhenabgleich: lokaler Offset ≈ ${geoidOffset.toFixed(2)} m · Gebäudehöhe 1.00× (keine Relief-Überhöhung).`);
 
   const out=[];
-  let triCount=0, clippedTriangles=0, capTriangles=0, foundationVertices=0, borderBuildingsClipped=0, borderFallbackFull=0;
+  let triCount=0, clippedTriangles=0, capTriangles=0, foundationVertices=0, borderBuildingsClipped=0, borderFallbackFull=0, borderHardCropped=0, borderHardCropFailed=0;
   const va=new THREE.Vector3(), vb=new THREE.Vector3(), vc=new THREE.Vector3();
   const modelClipPlanes = makeModelClipPlanes(t);
   const baseMm=Number(els.baseThickness.value);
@@ -1401,10 +1494,25 @@ async function loadBuildingTriangles(t) {
         capTriangles+=localCaps;
         clippedTriangles+=localClipped;
       } else {
-        // Gewünschter Fallback: dieses eine Randhaus vollständig belassen. Das ist
-        // leichter manuell abzuschneiden als ein offener, nicht reparierbarer Körper.
-        borderFallbackFull++;
-        for(const [ia,ib,ic] of tris){ out.push(...verts[ia].p,...verts[ib].p,...verts[ic].p); triCount++; }
+        // Zweite, streng getrennte Stufe: Das vollständige, druckfähige Haus wird
+        // als Solid per Boolean-INTERSECTION mit einem rechteckigen Relief-Prisma
+        // beschnitten. Der Boolean erzeugt die Rückwand / Schnittfläche selbst.
+        // Nur falls auch dieser robuste Nachschnitt scheitert, bleibt das ganze
+        // Haus als letzter druckfähiger Sicherheits-Fallback stehen.
+        const full=[];
+        for(const [ia,ib,ic] of tris) full.push(...verts[ia].p,...verts[ib].p,...verts[ic].p);
+        try {
+          const cropped = await hardCropBuildingSolid(full, t);
+          out.push(...cropped);
+          triCount += Math.floor(cropped.length / 9);
+          borderHardCropped++;
+        } catch (cropErr) {
+          borderHardCropFailed++;
+          borderFallbackFull++;
+          debug(`Randhaus Solid-Nachschnitt fehlgeschlagen: ${cropErr?.message || cropErr}`);
+          out.push(...full);
+          triCount += Math.floor(full.length / 9);
+        }
       }
       if(triCount>BUILDING_MAX_TRIANGLES){ tiles.dispose?.(); throw new Error(`Zu viele Gebäudedreiecke (> ${BUILDING_MAX_TRIANGLES.toLocaleString('de-CH')}). Bitte einen kleineren Ausschnitt wählen oder Gebäude deaktivieren.`); }
     }
@@ -1412,7 +1520,7 @@ async function loadBuildingTriangles(t) {
   debug(`Gebäude-Fundamentband: ${foundationBandMm.toFixed(2)} mm über lokalem Terrain.`);
   tiles.dispose?.();
   if (!triCount) throw new Error('Keine Gebäudedreiecke innerhalb des Reliefausschnitts gefunden.');
-  debug(`Gebäude: ${triCount.toLocaleString('de-CH')} Dreiecke übernommen; ${borderBuildingsClipped.toLocaleString('de-CH')} Randhäuser einzeln bearbeitet; ${capTriangles.toLocaleString('de-CH')} Abschluss-Dreiecke für geschlossene Schnittflächen; ${clippedTriangles.toLocaleString('de-CH')} ausserhalb liegende Dreiecke verworfen; Fallback vollständig: ${borderFallbackFull.toLocaleString('de-CH')} Haus/Häuser; ${foundationVertices.toLocaleString('de-CH')} Fassaden-Bodenpunkte ins Terrain verlängert.`);
+  debug(`Gebäude: ${triCount.toLocaleString('de-CH')} Dreiecke übernommen; ${borderBuildingsClipped.toLocaleString('de-CH')} Randhäuser bearbeitet; ${capTriangles.toLocaleString('de-CH')} Abschluss-Dreiecke im Primärschnitt; Solid-Nachschnitt erfolgreich: ${borderHardCropped.toLocaleString('de-CH')}; Solid-Nachschnitt fehlgeschlagen: ${borderHardCropFailed.toLocaleString('de-CH')}; Fallback vollständig: ${borderFallbackFull.toLocaleString('de-CH')}; ${foundationVertices.toLocaleString('de-CH')} Fassaden-Bodenpunkte ins Terrain verlängert.`);
   return { triangles:new Float32Array(out), meta:{ triangleCount:triCount, meshCount:meshes.length, heightFactor, geoidOffset } };
 }
 
